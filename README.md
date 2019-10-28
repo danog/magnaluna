@@ -1,5 +1,7 @@
 # magnaluna webradio
 
+[![Build Status](https://travis-ci.org/danog/magnaluna.svg?branch=master)](https://travis-ci.org/danog/magnaluna)
+
 Telegram webradio with advanced features like call programming and real-time call stats based on [MadelineProto](https://github.com/danog/MadelineProto) and [libtgvoip](https://github.com/danog/php-libtgvoip).  
 
 Created by Daniil Gentili (https://daniil.it).
