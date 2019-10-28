@@ -1,0 +1,13 @@
+theme: jekyll-theme-cayman
+gems:
+  - jekyll-sitemap
+  - jekyll-seo-tag
+url: https://magna.madelineproto.xyz
+
+twitter:
+  username: DaniilGentili
+  card: summary
+  
+author:
+  twitter: DaniilGentili
+  
