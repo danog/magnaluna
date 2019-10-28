@@ -4,6 +4,8 @@
 
 Telegram webradio with advanced features like call programming and real-time call stats based on [MadelineProto](https://github.com/danog/MadelineProto) and [libtgvoip](https://github.com/danog/php-libtgvoip).  
 
+![Screenshot](https://github.com/danog/magnaluna/raw/master/screenshot.png)
+
 Created by Daniil Gentili (https://daniil.it).
 
 ## Installation
