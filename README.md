@@ -6,6 +6,8 @@ Telegram webradio with advanced features like call programming and real-time cal
 
 ![Screenshot](https://github.com/danog/magnaluna/raw/master/screenshot.png)
 
+Try it on Telegram [@magnaluna](https://t.me/magnaluna)!
+
 Created by [Daniil Gentili](https://daniil.it).
 
 ## Installation
