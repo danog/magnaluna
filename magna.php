@@ -253,7 +253,7 @@ Propic art by @magnaluna on [deviantart](https://magnaluna.deviantart.com).", 'p
                     yield $this->messages->sendMessage(['peer' => $chat_id, 'message' => 'OK']);
                     $this->programmed_call[] = [$from_id, $time];
                     $key = \count($this->programmed_call) - 1;
-                    yield $this->sleep($time - \time());
+                    yield \danog\MadelineProto\Tools::sleep($time - \time());
                     yield $this->makeCall($from_id);
                     unset($this->programmed_call[$key]);
                 }
@@ -264,7 +264,7 @@ Propic art by @magnaluna on [deviantart](https://magnaluna.deviantart.com).", 'p
                 unset($message[0]);
                 $message = \implode(' ', $message);
                 $params = ['multiple' => true];
-                foreach (yield $this->get_dialogs() as $peer) {
+                foreach (yield $this->getDialogs() as $peer) {
                     $params []= ['peer' => $peer, 'message' => $message];
                 }
                 yield $this->messages->sendMessage($params);
@@ -292,7 +292,7 @@ Propic art by @magnaluna on [deviantart](https://magnaluna.deviantart.com).", 'p
             return;
         }
         $this->logger->logger($update);
-        $chat_id = $from_id = yield $this->get_info($update)['bot_api_id'];
+        $chat_id = $from_id = yield $this->getInfo($update)['bot_api_id'];
         $message = $update['message']['message'] ?? '';
         yield $this->handleMessage($chat_id, $from_id, $message);
     }
@@ -300,8 +300,8 @@ Propic art by @magnaluna on [deviantart](https://magnaluna.deviantart.com).", 'p
     public function onUpdateNewEncryptedMessage($update)
     {
         return;
-        $chat_id = yield $this->get_info($update)['InputEncryptedChat'];
-        $from_id = yield $this->get_secret_chat($chat_id)['user_id'];
+        $chat_id = yield $this->getInfo($update)['InputEncryptedChat'];
+        $from_id = yield $this->getSecretChat($chat_id)['user_id'];
         $message = isset($update['message']['decrypted_message']['message']) ? $update['message']['decrypted_message']['message'] : '';
         yield $this->handleMessage($chat_id, $from_id, $message);
     }
@@ -314,8 +314,8 @@ Propic art by @magnaluna on [deviantart](https://magnaluna.deviantart.com).", 'p
             if ($update['chat']['_'] !== 'encryptedChat') {
                 return;
             }
-            $chat_id = yield $this->get_info($update)['InputEncryptedChat'];
-            $from_id = yield $this->get_secret_chat($chat_id)['user_id'];
+            $chat_id = yield $this->getInfo($update)['InputEncryptedChat'];
+            $from_id = yield $this->getSecretChat($chat_id)['user_id'];
             $message = '';
         } catch (\danog\MadelineProto\Exception $e) {
             return;
@@ -342,8 +342,8 @@ Propic art by @magnaluna on [deviantart](https://magnaluna.deviantart.com).", 'p
         foreach ($this->programmed_call as $key => list($user, $time)) {
             continue;
             $sleepTime = $time <= \time() ? 0 : $time - \time();
-            $this->callFork((function () use ($sleepTime, $key, $user) {
-                yield $this->sleep($sleepTime);
+            \danog\MadelineProto\Tools::callFork((function () use ($sleepTime, $key, $user) {
+                yield \danog\MadelineProto\Tools::sleep($sleepTime);
                 yield $this->makeCall($user);
                 unset($this->programmed_call[$key]);
             })());
