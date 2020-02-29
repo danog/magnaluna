@@ -131,7 +131,7 @@ class StatusLoop extends ResumableSignalLoop
     }
 }
 
-class EventHandler extends \danog\MadelineProto\EventHandler
+class PonyEventHandler extends \danog\MadelineProto\EventHandler
 {
     const ADMINS = [101374607]; // @danogentili, creator of MadelineProto
     private $messageLoops = [];
@@ -139,6 +139,10 @@ class EventHandler extends \danog\MadelineProto\EventHandler
     private $programmed_call;
     private $my_users;
     public $calls = [];
+    public function getReportPeers(): array
+    {
+        return self::ADMINS;
+    }
     public function configureCall($call)
     {
         include 'songs.php';
@@ -364,14 +368,4 @@ if (!\class_exists('\\danog\\MadelineProto\\VoIPServerConfig')) {
     ]
 );
 $MadelineProto = new \danog\MadelineProto\API('session.madeline', ['secret_chats' => ['accept_chats' => false], 'logger' => ['logger' => 3, 'logger_level' => 5, 'logger_param' => \getcwd().'/MadelineProto.log'], 'updates' => ['getdifference_interval' => 10], 'serialization' => ['serialization_interval' => 30, 'cleanup_before_serialization' => true], 'flood_timeout' => ['wait_if_lt' => 86400]]);
-foreach (['calls', 'programmed_call', 'my_users'] as $key) {
-    if (isset($MadelineProto->API->storage[$key])) {
-        unset($MadelineProto->API->storage[$key]);
-    }
-}
-$MadelineProto->async(true);
-$MadelineProto->loop(function () use ($MadelineProto) {
-    yield $MadelineProto->start();
-    yield $MadelineProto->setEventHandler('\EventHandler');
-});
-$MadelineProto->loop();
+$MadelineProto->startAndLoop(PonyEventHandler::class);
