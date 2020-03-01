@@ -96,20 +96,9 @@ class StatusLoop extends ResumableSignalLoop
 
             if ($call->getCallState() === \danog\MadelineProto\VoIP::CALL_STATE_ENDED) {
                 try {
-                    /*yield $this->messages->sendMedia([
-                    'reply_to_msg_id' => $this->times[$call->getOtherID()][1],
-                    'peer' => $call->getOtherID(), 'message' => 'Call statistics by {$this->me}',
-                    'media' => [
-                    '_' => 'inputMediaUploadedDocument',
-                    'file' => "/tmp/stats".$call->getCallID()['id'].".txt",
-                    'attributes' => [
-                    ['_' => 'documentAttributeFilename', 'file_name' => "stats".$call->getCallID()['id'].".txt"]
-                    ]
-                    ],
-                    ]);*/
                     yield $MadelineProto->messages->sendMedia([
                             'reply_to_msg_id' => $this->call->mId,
-                            'peer'            => $call->getOtherID(), 'message' => "Debug info by {$this->me}",
+                            'peer'            => $call->getOtherID(), 'message' => "Debug info by {$this->API->getEventHandler()->getMe()}",
                             'media'           => [
                                 '_'          => 'inputMediaUploadedDocument',
                                 'file'       => '/tmp/logs'.$call->getCallID()['id'].'.log',
@@ -150,6 +139,10 @@ class PonyEventHandler extends \danog\MadelineProto\EventHandler
     public function onStart(): \Generator
     {
         $this->me = '@' . ((yield $this->getSelf()['username']) ?? 'magnaluna');
+    }
+    public function getMe(): string
+    {
+        return $this->me;
     }
     public function getReportPeers(): array
     {
