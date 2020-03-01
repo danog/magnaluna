@@ -11,7 +11,7 @@
  */
 
 if (\file_exists('vendor/autoload.php')) {
-    require '../MadelineProtoClean/vendor/autoload.php';
+    require 'vendor/autoload.php';
 } else {
     if (!\file_exists('madeline.php')) {
         \copy('https://phar.madelineproto.xyz/madeline.php', 'madeline.php');
