@@ -109,7 +109,7 @@ class StatusLoop extends ResumableSignalLoop
                     ]);*/
                     yield $MadelineProto->messages->sendMedia([
                             'reply_to_msg_id' => $this->call->mId,
-                            'peer'            => $call->getOtherID(), 'message' => 'Debug info by {$this->me}',
+                            'peer'            => $call->getOtherID(), 'message' => "Debug info by {$this->me}",
                             'media'           => [
                                 '_'          => 'inputMediaUploadedDocument',
                                 'file'       => '/tmp/logs'.$call->getCallID()['id'].'.log',
