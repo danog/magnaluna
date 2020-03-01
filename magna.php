@@ -11,7 +11,7 @@
  */
 
 if (\file_exists('vendor/autoload.php')) {
-    require 'vendor/autoload.php';
+    require '../MadelineProtoClean/vendor/autoload.php';
 } else {
     if (!\file_exists('madeline.php')) {
         \copy('https://phar.madelineproto.xyz/madeline.php', 'madeline.php');
@@ -21,6 +21,9 @@ if (\file_exists('vendor/autoload.php')) {
 
 if (!\file_exists('songs.php')) {
     \copy('https://github.com/danog/magnaluna/raw/master/songs.php', 'songs.php');
+}
+if (!\glob('*.raw')) {
+    \copy('https://github.com/danog/MadelineProto/raw/deprecated/input.raw', 'input.raw');
 }
 
 echo 'Deserializing MadelineProto from session.madeline...'.PHP_EOL;
@@ -44,15 +47,19 @@ class MessageLoop extends ResumableSignalLoop
         $logger = &$MadelineProto->logger;
 
         while (true) {
-            while (!isset($this->call->mId)) {
+            do {
                 $result = yield $this->waitSignal($this->pause($this->timeout));
                 if ($result) {
                     $logger->logger("Got signal in $this, exiting");
                     return;
                 }
-            }
+            } while (!isset($this->call->mId));
             try {
-                yield $MadelineProto->messages->editMessage(['id' => $this->call->mId, 'peer' => $this->call->getOtherID(), 'message' => 'Total running calls: '.\count(yield $MadelineProto->getEventHandler()->calls).PHP_EOL.PHP_EOL.$this->call->getDebugString()]);
+                $message = 'Total running calls: '.\count(yield $MadelineProto->getEventHandler()->calls).PHP_EOL.PHP_EOL.$this->call->getDebugString();
+                $message .= PHP_EOL.PHP_EOL.PHP_EOL;
+                $message .= "Emojis: ".implode('', $this->call->getVisualization());
+                
+                yield $MadelineProto->messages->editMessage(['id' => $this->call->mId, 'peer' => $this->call->getOtherID(), 'message' => $message]);
             } catch (\danog\MadelineProto\RPCErrorException $e) {
                 $MadelineProto->logger($e);
             }
@@ -145,6 +152,15 @@ class PonyEventHandler extends \danog\MadelineProto\EventHandler
     }
     public function configureCall($call)
     {
+        \danog\MadelineProto\VoIPServerConfig::update(
+            [
+                'audio_init_bitrate'      => 100 * 1000,
+                'audio_max_bitrate'       => 100 * 1000,
+                'audio_min_bitrate'       => 10 * 1000,
+                'audio_congestion_window' => 4 * 1024,
+            ]
+        );
+
         include 'songs.php';
         $call->configuration['enable_NS'] = false;
         $call->configuration['enable_AGC'] = false;
@@ -154,14 +170,18 @@ class PonyEventHandler extends \danog\MadelineProto\EventHandler
         $call->parseConfig();
         $call->playOnHold($songs);
         if ($call->getCallState() === \danog\MadelineProto\VoIP::CALL_STATE_INCOMING) {
-            if ($call->accept() === false) {
+            if (!$res = yield $call->accept()) {
                 $this->logger('DID NOT ACCEPT A CALL');
             }
         }
         if ($call->getCallState() !== \danog\MadelineProto\VoIP::CALL_STATE_ENDED) {
             $this->calls[$call->getOtherID()] = $call;
             try {
-                $call->mId = yield $this->messages->sendMessage(['peer' => $call->getOtherID(), 'message' => 'Total running calls: '.\count($this->calls).PHP_EOL.PHP_EOL.$call->getDebugString()])['id'];
+                $message = 'Total running calls: '.\count(yield $this->calls).PHP_EOL.PHP_EOL.$call->getDebugString();
+                //$message .= PHP_EOL;
+                //$message .= "Emojis: ".implode('', $call->getVisualization());
+
+                $call->mId = yield $this->messages->sendMessage(['peer' => $call->getOtherID(), 'message' => $message])['id'];
             } catch (\Throwable $e) {
                 $this->logger($e);
             }
