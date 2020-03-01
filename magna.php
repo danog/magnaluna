@@ -98,7 +98,7 @@ class StatusLoop extends ResumableSignalLoop
                 try {
                     /*yield $this->messages->sendMedia([
                     'reply_to_msg_id' => $this->times[$call->getOtherID()][1],
-                    'peer' => $call->getOtherID(), 'message' => 'Call statistics by @magnaluna',
+                    'peer' => $call->getOtherID(), 'message' => 'Call statistics by {$this->me}',
                     'media' => [
                     '_' => 'inputMediaUploadedDocument',
                     'file' => "/tmp/stats".$call->getCallID()['id'].".txt",
@@ -109,7 +109,7 @@ class StatusLoop extends ResumableSignalLoop
                     ]);*/
                     yield $MadelineProto->messages->sendMedia([
                             'reply_to_msg_id' => $this->call->mId,
-                            'peer'            => $call->getOtherID(), 'message' => 'Debug info by @magnaluna',
+                            'peer'            => $call->getOtherID(), 'message' => 'Debug info by {$this->me}',
                             'media'           => [
                                 '_'          => 'inputMediaUploadedDocument',
                                 'file'       => '/tmp/logs'.$call->getCallID()['id'].'.log',
@@ -145,7 +145,12 @@ class PonyEventHandler extends \danog\MadelineProto\EventHandler
     private $statusLoops = [];
     private $programmed_call;
     private $my_users;
+    private $me;
     public $calls = [];
+    public function onStart(): \Generator
+    {
+        $this->me = '@' . ((yield $this->getSelf()['username']) ?? 'magnaluna');
+    }
     public function getReportPeers(): array
     {
         return self::ADMINS;
@@ -240,7 +245,7 @@ class PonyEventHandler extends \danog\MadelineProto\EventHandler
             if (!isset($this->my_users[$from_id]) || $message === '/start') {
                 $this->my_users[$from_id] = true;
                 $message = '/call';
-                yield $this->messages->sendMessage(['no_webpage' => true, 'peer' => $chat_id, 'message' => "Hi, I'm @magnaluna the webradio.
+                yield $this->messages->sendMessage(['no_webpage' => true, 'peer' => $chat_id, 'message' => "Hi, I'm {$this->me} the webradio.
 
 Call _me_ to listen to some **awesome** music, or send /call to make _me_ call _you_ (don't forget to disable call privacy settings!).
 
@@ -258,7 +263,7 @@ I'm a userbot powered by @MadelineProto, created by @danogentili.
 
 Source code: https://github.com/danog/MadelineProto
 
-Propic art by @magnaluna on [deviantart](https://magnaluna.deviantart.com).", 'parse_mode' => 'Markdown']);
+Propic art by magnaluna on [deviantart](https://magnaluna.deviantart.com).", 'parse_mode' => 'Markdown']);
             }
             if (!isset($this->calls[$from_id]) && $message === '/call') {
                 yield $this->makeCall($from_id);
