@@ -57,8 +57,8 @@ class MessageLoop extends ResumableSignalLoop
             try {
                 $message = 'Total running calls: '.\count(yield $MadelineProto->getEventHandler()->calls).PHP_EOL.PHP_EOL.$this->call->getDebugString();
                 $message .= PHP_EOL.PHP_EOL.PHP_EOL;
-                $message .= "Emojis: ".implode('', $this->call->getVisualization());
-                
+                $message .= "Emojis: ".\implode('', $this->call->getVisualization());
+
                 yield $MadelineProto->messages->editMessage(['id' => $this->call->mId, 'peer' => $this->call->getOtherID(), 'message' => $message]);
             } catch (\danog\MadelineProto\RPCErrorException $e) {
                 $MadelineProto->logger($e);
