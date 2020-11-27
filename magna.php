@@ -10,6 +10,8 @@
  * If not, see <http://www.gnu.org/licenses/>.
  */
 
+use danog\Loop\ResumableSignalLoop;
+
 if (\file_exists('vendor/autoload.php')) {
     require 'vendor/autoload.php';
 } else {
@@ -28,11 +30,9 @@ if (!\glob('*.raw')) {
 
 echo 'Deserializing MadelineProto from session.madeline...'.PHP_EOL;
 
-use danog\MadelineProto\Loop\Impl\ResumableSignalLoop;
-
 class MessageLoop extends ResumableSignalLoop
 {
-    const INTERVAL = 10;
+    const INTERVAL = 10000;
     private $timeout;
     private $call;
     public function __construct($API, $call, $timeout = self::INTERVAL)
@@ -41,7 +41,7 @@ class MessageLoop extends ResumableSignalLoop
         $this->call = $call;
         $this->timeout = $timeout;
     }
-    public function loop()
+    public function loop(): \Generator
     {
         $MadelineProto = $this->API;
         $logger = &$MadelineProto->logger;
@@ -54,6 +54,7 @@ class MessageLoop extends ResumableSignalLoop
                     return;
                 }
             } while (!isset($this->call->mId));
+            $result = yield $this->waitSignal($this->pause($this->timeout));
             try {
                 $message = 'Total running calls: '.\count(yield $MadelineProto->getEventHandler()->calls).PHP_EOL.PHP_EOL.$this->call->getDebugString();
                 $message .= PHP_EOL.PHP_EOL.PHP_EOL;
@@ -72,7 +73,7 @@ class MessageLoop extends ResumableSignalLoop
 }
 class StatusLoop extends ResumableSignalLoop
 {
-    const INTERVAL = 2;
+    const INTERVAL = 2000;
     private $timeout;
     private $call;
     public function __construct($API, $call, $timeout = self::INTERVAL)
@@ -81,7 +82,7 @@ class StatusLoop extends ResumableSignalLoop
         $this->call = $call;
         $this->timeout = $timeout;
     }
-    public function loop()
+    public function loop(): \Generator
     {
         $MadelineProto = $this->API;
         $logger = &$MadelineProto->logger;
@@ -309,7 +310,7 @@ Propic art by magnaluna on [deviantart](https://magnaluna.deviantart.com).", 'pa
         if ($update['message']['out'] || $update['message']['to_id']['_'] !== 'peerUser' || !isset($update['message']['from_id'])) {
             return;
         }
-        $this->logger->logger($update);
+        $this->logger($update);
         $chat_id = $from_id = yield $this->getInfo($update)['bot_api_id'];
         $message = $update['message']['message'] ?? '';
         yield $this->handleMessage($chat_id, $from_id, $message);
@@ -350,7 +351,7 @@ Propic art by magnaluna on [deviantart](https://magnaluna.deviantart.com).", 'pa
 
     /*public function onAny($update)
     {
-        $this->logger->logger($update);
+        $this->logger($update);
     }*/
 
     public function __construct($API)
