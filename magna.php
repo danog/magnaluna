@@ -11,6 +11,7 @@
  */
 
 use danog\Loop\ResumableSignalLoop;
+use danog\MadelineProto\EventHandler;
 
 if (\file_exists('vendor/autoload.php')) {
     require 'vendor/autoload.php';
@@ -35,6 +36,7 @@ class MessageLoop extends ResumableSignalLoop
     const INTERVAL = 10000;
     private $timeout;
     private $call;
+    private EventHandler $API;
     public function __construct($API, $call, $timeout = self::INTERVAL)
     {
         $this->API = $API;
@@ -44,7 +46,7 @@ class MessageLoop extends ResumableSignalLoop
     public function loop(): \Generator
     {
         $MadelineProto = $this->API;
-        $logger = &$MadelineProto->logger;
+        $logger = $MadelineProto->getLogger();
 
         while (true) {
             do {
@@ -76,6 +78,7 @@ class StatusLoop extends ResumableSignalLoop
     const INTERVAL = 2000;
     private $timeout;
     private $call;
+    private EventHandler $API;
     public function __construct($API, $call, $timeout = self::INTERVAL)
     {
         $this->API = $API;
@@ -85,21 +88,26 @@ class StatusLoop extends ResumableSignalLoop
     public function loop(): \Generator
     {
         $MadelineProto = $this->API;
-        $logger = &$MadelineProto->logger;
+        $logger = $MadelineProto->getLogger();
         $call = $this->call;
 
         while (true) {
             $result = yield $this->waitSignal($this->pause($this->timeout));
             if ($result) {
                 $logger->logger("Got signal in $this, exiting");
+                $MadelineProto->getEventHandler()->cleanUpCall($call->getOtherID());
                 return;
             }
 
             if ($call->getCallState() === \danog\MadelineProto\VoIP::CALL_STATE_ENDED) {
-                try {
-                    yield $MadelineProto->messages->sendMedia([
+                $MadelineProto->getEventHandler()->cleanUpCall($call->getOtherID());
+                if (\file_exists('/tmp/logs'.$call->getCallID()['id'].'.log')) {
+                    @\unlink('/tmp/logs'.$call->getCallID()['id'].'.log');
+                    try {
+                        $me = yield $this->API->getEventHandler()->getMe();
+                        yield $MadelineProto->messages->sendMedia([
                             'reply_to_msg_id' => $this->call->mId,
-                            'peer'            => $call->getOtherID(), 'message' => "Debug info by {$this->API->getEventHandler()->getMe()}",
+                            'peer'            => $call->getOtherID(), 'message' => "Debug info by $me",
                             'media'           => [
                                 '_'          => 'inputMediaUploadedDocument',
                                 'file'       => '/tmp/logs'.$call->getCallID()['id'].'.log',
@@ -108,16 +116,17 @@ class StatusLoop extends ResumableSignalLoop
                                 ],
                             ],
                         ]);
-                } catch (\danog\MadelineProto\Exception $e) {
-                    $MadelineProto->logger($e);
-                } catch (\danog\MadelineProto\RPCErrorException $e) {
-                    $MadelineProto->logger($e);
-                } catch (\danog\MadelineProto\Exception $e) {
-                    $MadelineProto->logger($e);
+                    } catch (\danog\MadelineProto\Exception $e) {
+                        $MadelineProto->logger($e);
+                    } catch (\danog\MadelineProto\RPCErrorException $e) {
+                        $MadelineProto->logger($e);
+                    } catch (\danog\MadelineProto\Exception $e) {
+                        $MadelineProto->logger($e);
+                    }
                 }
-                @\unlink('/tmp/logs'.$call->getCallID()['id'].'.log');
-                @\unlink('/tmp/stats'.$call->getCallID()['id'].'.txt');
-                $MadelineProto->getEventHandler()->cleanUpCall($call->getOtherID());
+                if (\file_exists('/tmp/stats'.$call->getCallID()['id'].'.txt')) {
+                    @\unlink('/tmp/stats'.$call->getCallID()['id'].'.txt');
+                }
                 return;
             }
         }
@@ -139,7 +148,7 @@ class PonyEventHandler extends \danog\MadelineProto\EventHandler
     public $calls = [];
     public function onStart(): \Generator
     {
-        $this->me = '@' . ((yield $this->getSelf()['username']) ?? 'magnaluna');
+        $this->me = '@' . (((yield $this->getSelf())['username']) ?? 'magnaluna');
     }
     public function getMe(): string
     {
@@ -386,5 +395,5 @@ if (!\class_exists('\\danog\\MadelineProto\\VoIPServerConfig')) {
         'audio_congestion_window' => 4 * 1024,
     ]
 );
-$MadelineProto = new \danog\MadelineProto\API('session.madeline', ['secret_chats' => ['accept_chats' => false], 'logger' => ['logger' => 3, 'logger_level' => 5, 'logger_param' => \getcwd().'/MadelineProto.log'], 'updates' => ['getdifference_interval' => 10], 'serialization' => ['serialization_interval' => 30, 'cleanup_before_serialization' => true], 'flood_timeout' => ['wait_if_lt' => 86400]]);
+$MadelineProto = new \danog\MadelineProto\API('magna.madeline', ['secret_chats' => ['accept_chats' => false], 'logger' => ['logger' => 3, 'logger_level' => 5, 'logger_param' => \getcwd().'/MadelineProto.log'], 'updates' => ['getdifference_interval' => 10], 'serialization' => ['serialization_interval' => 30, 'cleanup_before_serialization' => true], 'flood_timeout' => ['wait_if_lt' => 86400]]);
 $MadelineProto->startAndLoop(PonyEventHandler::class);
