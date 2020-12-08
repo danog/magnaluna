@@ -10,7 +10,7 @@
         "issues": "https://github.com/danog/magnaluna/issues"
     },
     "require": {
-        "danog/madelineproto": "^5"
+        "danog/madelineproto": "dev-master"
     },
     "license": "AGPL-3.0-only",
     "require-dev": {
