@@ -20,8 +20,8 @@ Don't forget to install the [required dependencies](https://docs.madelineproto.x
 
 ## Converting songs
 
-In order to play songs, they must be first converted to raw PCM format (support for OGG OPUS files will be added soon):
+In order to play songs, they must be first converted to the correct format, using the convert.php script:
 
 ```
-ffmpeg -i anyaudioorvideo.mp3 -f s16le -ac 1 -ar 48000 -acodec pcm_s16le mysong.raw
+wget https://github.com/danog/magnaluna/raw/master/convert.php && php convert.php in.mp3 out.ogg
 ```
