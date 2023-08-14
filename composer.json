@@ -9,12 +9,13 @@
     "support": {
         "issues": "https://github.com/danog/magnaluna/issues"
     },
+    "minimum-stability": "beta",
     "require": {
-        "danog/madelineproto": "dev-master"
+        "danog/madelineproto": "^8"
     },
     "license": "AGPL-3.0-only",
     "require-dev": {
-        "amphp/php-cs-fixer-config": "dev-master"
+        "amphp/php-cs-fixer-config": "^2"
     },
     "scripts": {
         "check": [
