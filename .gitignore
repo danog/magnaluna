@@ -98,7 +98,7 @@ composer.lock
 b.php
 *.log
 telegram-cli*
-src/danog/MadelineProto/Fuzzer.php
+src/Fuzzer.php
 fuzzer.php
 tests/500mb
 *.save
