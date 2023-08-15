@@ -15,8 +15,19 @@ declare(strict_types=1);
 use danog\Loop\ResumableSignalLoop;
 use danog\MadelineProto\API;
 use danog\MadelineProto\EventHandler;
+use danog\MadelineProto\Broadcast\Progress;
+use danog\MadelineProto\Broadcast\Status;
+use danog\MadelineProto\EventHandler\Attributes\Cron;
 use danog\MadelineProto\EventHandler\Attributes\Handler;
+use danog\MadelineProto\EventHandler\Filter\FilterCommand;
+use danog\MadelineProto\EventHandler\Filter\FilterRegex;
+use danog\MadelineProto\EventHandler\Filter\FilterText;
+use danog\MadelineProto\EventHandler\Filter\FilterTextCaseInsensitive;
+use danog\MadelineProto\EventHandler\Message;
+use danog\MadelineProto\EventHandler\Message\Service\DialogPhotoChanged;
+use danog\MadelineProto\EventHandler\SimpleFilter\FromAdmin;
 use danog\MadelineProto\EventHandler\SimpleFilter\Incoming;
+use danog\MadelineProto\EventHandler\SimpleFilter\IsReply;
 use danog\MadelineProto\Exception;
 use danog\MadelineProto\LocalFile;
 use danog\MadelineProto\RPCErrorException;
@@ -166,6 +177,34 @@ class MyEventHandler extends SimpleEventHandler
             });
         }
     }
+    private int $lastLog = 0;
+    /**
+     * Handles updates to an in-progress broadcast.
+     */
+    public function onUpdateBroadcastProgress(Progress $progress): void
+    {
+        if (time() - $this->lastLog > 5 || $progress->status === Status::FINISHED) {
+            $this->lastLog = time();
+            $this->sendMessageToAdmins((string) $progress);
+        }
+    }
+
+    #[FilterCommand('broadcast')]
+    public function broadcastCommand(Message & FromAdmin $message): void
+    {
+        // We can broadcast messages to all users with /broadcast
+        if (!$message->replyToMsgId) {
+            $message->reply("You should reply to the message you want to broadcast.");
+            return;
+        }
+        $this->broadcastForwardMessages(
+            from_peer: $message->senderId,
+            message_ids: [$message->replyToMsgId],
+            drop_author: true,
+            pin: true,
+        );
+    }
+
     public function getMe(): string
     {
         return $this->me;
@@ -274,7 +313,11 @@ I'm a userbot powered by @MadelineProto, created by @danogentili.
 
 Source code: https://github.com/danog/MadelineProto
 
-Propic art by magnaluna on [deviantart](https://magnaluna.deviantart.com).", 'parse_mode' => 'Markdown']);
+Propic art by magnaluna on [deviantart](https://magnaluna.deviantart.com).
+
+
+Note for iOS users: the official Telegram iOS app has a bug which prevents me from working properly, I'm looking into it, try calling from your Mac/Android/PC, instead!
+", 'parse_mode' => 'Markdown']);
             }
             if (!isset($this->calls[$from_id]) && $message === '/call') {
                 $this->makeCall($from_id);
@@ -293,17 +336,6 @@ Propic art by magnaluna on [deviantart](https://magnaluna.deviantart.com).", 'pa
                     $this->makeCall($from_id);
                     unset($this->programmed_call[$key]);
                 }
-            }
-            if ($message === '/broadcast' && in_array(self::ADMINS, $from_id)) {
-                $time = time() + 100;
-                $message = explode(' ', $message, 2);
-                unset($message[0]);
-                $message = implode(' ', $message);
-                $params = ['multiple' => true];
-                foreach ($this->getDialogs() as $peer) {
-                    $params []= ['peer' => $peer, 'message' => $message];
-                }
-                $this->messages->sendMessage($params);
             }
         } catch (RPCErrorException $e) {
             try {
