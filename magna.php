@@ -44,9 +44,9 @@ if (file_exists('vendor/autoload.php')) {
     include 'madeline.php';
 }
 
-$songs = glob('*ogg')
+$songs = glob('*ogg');
 if (!$songs) {
-    die('No songs defined! Convert some songs by sending them to https://t.me/libtgvoipbot');
+    die('No songs defined! Convert some songs by sending them to https://t.me/libtgvoipbot and putting them in the current directory'.PHP_EOL);
 }
 
 /*class MessageLoop extends ResumableSignalLoop
@@ -219,7 +219,7 @@ class MyEventHandler extends SimpleEventHandler
     {
         $songs = glob('*ogg');
         if (!$songs) {
-            throw new \AssertionError('No songs defined! Convert some songs by sending them to https://t.me/libtgvoipbot');
+            throw new \AssertionError('No songs defined! Convert some songs by sending them to https://t.me/libtgvoipbot and putting them in the current directory');
         }
         $songs_length = count($songs);
 
