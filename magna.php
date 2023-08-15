@@ -237,13 +237,12 @@ class MyEventHandler extends SimpleEventHandler
             $this->configureCall($this->requestCall($user));
         } catch (RPCErrorException $e) {
             try {
+                if ($e->rpc === "CALL_PROTOCOL_COMPAT_LAYER_INVALID") {
+                   $e = "Please call me using Telegram Desktop, Telegram for Mac or Telegram Android!";
+                }
                 if ($e->rpc === 'USER_PRIVACY_RESTRICTED') {
-                    $e = 'Please disable call privacy settings to make me call you';
-                }/* elseif (strpos($e->rpc, 'FLOOD_WAIT_') === 0) {
-                    $t = str_replace('FLOOD_WAIT_', '', $e->rpc);
-                    $this->programmed_call[] = [$user, time() + 1 + $t];
-                    $e = "I'll call you back in $t seconds.\nYou can also call me right now.";
-                }*/
+                    $e = 'Please disable call privacy settings to make me call you (or call me yourself!)';
+                }
                 $this->messages->sendMessage(['peer' => $user, 'message' => (string) $e]);
             } catch (RPCErrorException $e) {
             }
@@ -363,7 +362,16 @@ Propic art by magnaluna on [deviantart](https://magnaluna.deviantart.com).", 'pa
     #[Handler]
     public function incomingCall(VoIP&Incoming $voip): void
     {
-        $this->configureCall($voip->accept());
+        try {
+            $voip = $voip->accept();
+        } catch (RPCErrorException $e) {
+            if ($e->rpc === "CALL_PROTOCOL_COMPAT_LAYER_INVALID") {
+                $message->reply("Please call me using Telegram Desktop, Telegram for Mac or Telegram Android!");
+                return;
+            }
+            throw $e;
+        }
+        $this->configureCall($voip);
     }
 
     public function __sleep(): array
