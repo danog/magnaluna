@@ -44,8 +44,6 @@ if (file_exists('vendor/autoload.php')) {
     include 'madeline.php';
 }
 
-echo 'Deserializing MadelineProto from session.madeline...'.PHP_EOL;
-
 /*class MessageLoop extends ResumableSignalLoop
 {
     const INTERVAL = 10000;
