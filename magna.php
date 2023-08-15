@@ -1,4 +1,3 @@
-#!/usr/bin/env php
 <?php
 /* Copyright 2016-2019 Daniil Gentili
  * (https://daniil.it)
@@ -36,14 +35,14 @@ use danog\MadelineProto\Tools;
 use danog\MadelineProto\VoIP;
 use danog\MadelineProto\VoIP\CallState;
 
-//if (file_exists('vendor/autoload.php')) {
-require 'vendor/autoload.php';
-/*} else {
+if (file_exists('vendor/autoload.php')) {
+    require 'vendor/autoload.php';
+} else {
     if (!file_exists('madeline.php')) {
         copy('https://phar.madelineproto.xyz/madeline.php', 'madeline.php');
     }
     include 'madeline.php';
-}*/
+}
 
 echo 'Deserializing MadelineProto from session.madeline...'.PHP_EOL;
 
