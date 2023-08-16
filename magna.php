@@ -400,7 +400,7 @@ Note for iOS users: the official Telegram iOS app has a bug which prevents me fr
             $voip = $voip->accept();
         } catch (RPCErrorException $e) {
             if ($e->rpc === "CALL_PROTOCOL_COMPAT_LAYER_INVALID") {
-                $message->reply("Please call me using Telegram Desktop, Telegram for Mac or Telegram Android!");
+                $this->messages->sendMessage(peer: $voip->otherID, message: "Please call me using Telegram Desktop, Telegram for Mac or Telegram Android!");
                 return;
             }
             throw $e;
