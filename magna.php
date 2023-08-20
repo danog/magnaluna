@@ -134,7 +134,7 @@ class MyEventHandler extends SimpleEventHandler
             try {
                 $message = 'Total running calls: '.count($this->calls).PHP_EOL.PHP_EOL;
                 $message .= PHP_EOL.PHP_EOL.PHP_EOL;
-                $message .= "Emojis: ".implode('', $call->getVisualization());
+                $message .= "Emojis: ".implode('', $call->getVisualization() ?? []);
 
                 $this->messages->editMessage(['id' => $this->messageIds[$call->otherID], 'peer' => $user, 'message' => $message]);
             } catch (RPCErrorException $e) {
@@ -157,7 +157,7 @@ class MyEventHandler extends SimpleEventHandler
             try {
                 $message = 'Total running calls: '.count($this->calls).PHP_EOL.PHP_EOL;
                 $message .= PHP_EOL.PHP_EOL.PHP_EOL;
-                $message .= "Emojis: ".implode('', $call->getVisualization());
+                $message .= "Emojis: ".implode('', $call->getVisualization() ?? []);
 
                 $this->messages[$call->otherID] = $this->sendMessage(peer: $call->otherID, message: $message)->id;
                 $this->calls[$call->otherID] = $call;
