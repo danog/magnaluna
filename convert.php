@@ -1,4 +1,4 @@
-<?php
+<?php declare(strict_types=1);
 
 if (!file_exists('madeline.php')) {
     copy('https://phar.madelineproto.xyz/madeline.php', 'madeline.php');
