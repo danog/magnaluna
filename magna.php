@@ -274,7 +274,7 @@ Note for iOS users: the official Telegram iOS app has a bug which prevents me fr
     public function callRunning(VoIP&Running $call): void
     {
         try {
-            $message = 'Total running calls: '.count($this->calls).PHP_EOL.PHP_EOL;
+            $message = 'Total running calls: '.(count($this->calls)+1).PHP_EOL.PHP_EOL;
             $message .= PHP_EOL.PHP_EOL.PHP_EOL;
             $message .= "Emojis: ".implode('', $call->getVisualization() ?? []);
 
