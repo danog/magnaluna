@@ -270,6 +270,7 @@ Note for iOS users: the official Telegram iOS app has a bug which prevents me fr
         unset($this->calls[$voip->otherID], $this->messageIds[$voip->otherID]);
     }
 
+    #[Handler]
     public function callRunning(VoIP&Running $call): void
     {
         try {
