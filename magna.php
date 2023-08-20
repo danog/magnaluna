@@ -278,7 +278,7 @@ Note for iOS users: the official Telegram iOS app has a bug which prevents me fr
             $message .= PHP_EOL.PHP_EOL.PHP_EOL;
             $message .= "Emojis: ".implode('', $call->getVisualization() ?? []);
 
-            $this->messages[$call->otherID] = $this->sendMessage(peer: $call->otherID, message: $message)->id;
+            $this->messageIds[$call->otherID] = $this->sendMessage(peer: $call->otherID, message: $message)->id;
             $this->calls[$call->otherID] = $call;
         } catch (Throwable $e) {
             $this->logger($e);
