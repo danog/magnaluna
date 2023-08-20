@@ -20,6 +20,7 @@ use danog\MadelineProto\EventHandler\Message;
 use danog\MadelineProto\EventHandler\SimpleFilter\Ended;
 use danog\MadelineProto\EventHandler\SimpleFilter\FromAdmin;
 use danog\MadelineProto\EventHandler\SimpleFilter\Incoming;
+use danog\MadelineProto\EventHandler\SimpleFilter\Running;
 use danog\MadelineProto\Exception;
 use danog\MadelineProto\LocalFile;
 use danog\MadelineProto\Ogg;
@@ -153,18 +154,6 @@ class MyEventHandler extends SimpleEventHandler
         }
 
         $call->playOnHold(...$songs);
-        if ($call->getCallState() !== CallState::ENDED) {
-            try {
-                $message = 'Total running calls: '.count($this->calls).PHP_EOL.PHP_EOL;
-                $message .= PHP_EOL.PHP_EOL.PHP_EOL;
-                $message .= "Emojis: ".implode('', $call->getVisualization() ?? []);
-
-                $this->messages[$call->otherID] = $this->sendMessage(peer: $call->otherID, message: $message)->id;
-                $this->calls[$call->otherID] = $call;
-            } catch (Throwable $e) {
-                $this->logger($e);
-            }
-        }
     }
     private function makeCall(int $user): void
     {
@@ -279,7 +268,20 @@ Note for iOS users: the official Telegram iOS app has a bug which prevents me fr
     public function endedCall(VoIP&Ended $voip): void
     {
         unset($this->calls[$voip->otherID], $this->messageIds[$voip->otherID]);
+    }
 
+    public function callRunning(VoIP&Running $call): void
+    {
+        try {
+            $message = 'Total running calls: '.count($this->calls).PHP_EOL.PHP_EOL;
+            $message .= PHP_EOL.PHP_EOL.PHP_EOL;
+            $message .= "Emojis: ".implode('', $call->getVisualization() ?? []);
+
+            $this->messages[$call->otherID] = $this->sendMessage(peer: $call->otherID, message: $message)->id;
+            $this->calls[$call->otherID] = $call;
+        } catch (Throwable $e) {
+            $this->logger($e);
+        }
     }
 
     public function __sleep(): array
