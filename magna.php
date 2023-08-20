@@ -29,6 +29,7 @@ use danog\MadelineProto\EventHandler\SimpleFilter\Incoming;
 use danog\MadelineProto\EventHandler\SimpleFilter\IsReply;
 use danog\MadelineProto\Exception;
 use danog\MadelineProto\LocalFile;
+use danog\MadelineProto\Ogg;
 use danog\MadelineProto\RPCErrorException;
 use danog\MadelineProto\SimpleEventHandler;
 use danog\MadelineProto\Tools;
@@ -164,9 +165,23 @@ class MyEventHandler extends SimpleEventHandler
     private $my_users;
     private $me;
     public $calls = [];
+    private array $songs = [];
     public function onStart(): void
     {
         $this->me = '@' . ((($this->getSelf())['username']) ?? 'magnaluna');
+
+        $songs = glob('*ogg');
+        if (!$songs) {
+            throw new \AssertionError('No songs defined! Convert some songs by sending them to https://t.me/libtgvoipbot and putting them in the current directory');
+        }
+        foreach ($songs as $song) {
+            try {
+                Ogg::validateOgg(new LocalFile($song));
+            } catch (Throwable $e) {
+                throw new AssertionError("An error occurred during validation of $song, please convert the file using convert.php or @libtgvoipbot!", 0, $e);
+            }
+        }
+        $this->songs = $songs;
 
         $this->programmed_call = [];
         foreach ($this->programmed_call as $key => [$user, $time]) {
@@ -217,10 +232,7 @@ class MyEventHandler extends SimpleEventHandler
     }
     public function configureCall(VoIP $call): void
     {
-        $songs = glob('*ogg');
-        if (!$songs) {
-            throw new \AssertionError('No songs defined! Convert some songs by sending them to https://t.me/libtgvoipbot and putting them in the current directory');
-        }
+        $songs = $this->songs;
         $songs_length = count($songs);
 
         for ($x = 0; $x < $songs_length; $x++) {
