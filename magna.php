@@ -99,6 +99,12 @@ class MyEventHandler extends SimpleEventHandler
         }
     }
 
+    #[FilterCommand('restart')]
+    public function restartCommand(Message & FromAdmin $message): void
+    {
+        $this->restart();
+    }
+    
     #[FilterCommand('broadcast')]
     public function broadcastCommand(Message & FromAdmin $message): void
     {
