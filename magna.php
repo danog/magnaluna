@@ -167,7 +167,7 @@ class MyEventHandler extends SimpleEventHandler
             }
             try {
                 $message = 'Total running calls: '.count($this->calls).PHP_EOL.PHP_EOL;
-                $message .= PHP_EOL.PHP_EOL.PHP_EOL;
+                $message .= "Send /skip to skip the current song.".PHP_EOL.PHP_EOL.PHP_EOL;
                 $message .= "Emojis: ".implode('', $call->getVisualization() ?? []);
 
                 $this->messages->editMessage(['id' => $this->messageIds[$call->otherID], 'peer' => $user, 'message' => $message]);
@@ -309,7 +309,7 @@ Note for iOS users: the official Telegram iOS app has a bug which prevents me fr
         }
         try {
             $message = 'Total running calls: '.(count($this->calls)+1).PHP_EOL.PHP_EOL;
-            $message .= PHP_EOL.PHP_EOL.PHP_EOL;
+            $message .= "Send /skip to skip the current song.".PHP_EOL.PHP_EOL.PHP_EOL;
             $message .= "Emojis: ".implode('', $call->getVisualization() ?? []);
 
             $this->messageIds[$call->otherID] = $this->sendMessage(peer: $call->otherID, message: $message)->id;
