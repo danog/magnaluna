@@ -220,6 +220,8 @@ class MyEventHandler extends SimpleEventHandler
 
 Call _me_ to listen to some **awesome** music, or send /call to make _me_ call _you_ (don't forget to disable call privacy settings!).
 
+Use /skip to skip the current song.
+
 You can also program a phone call with /program:
 
 /program 29 August 2018 - call me the 29th of august 2018
