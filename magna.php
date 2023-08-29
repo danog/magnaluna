@@ -104,7 +104,7 @@ class MyEventHandler extends SimpleEventHandler
     {
         $this->restart();
     }
-    
+
     #[FilterCommand('broadcast')]
     public function broadcastCommand(Message & FromAdmin $message): void
     {
@@ -119,6 +119,33 @@ class MyEventHandler extends SimpleEventHandler
             drop_author: true,
             pin: true,
         );
+    }
+
+    #[FilterCommand('bforward')]
+    public function broadcastForwardCommand(Message & FromAdmin $message): void
+    {
+        // We can broadcast messages to all users with /broadcast
+        if (!$message->replyToMsgId) {
+            $message->reply("You should reply to the message you want to broadcast.");
+            return;
+        }
+        $this->broadcastForwardMessages(
+            from_peer: $message->senderId,
+            message_ids: [$message->replyToMsgId],
+            drop_author: false,
+            pin: true,
+        );
+    }
+
+    #[FilterCommand('skip')]
+    public function skipCommand(Incoming&Message $message): void
+    {
+        $call = $this->getCallByPeer($message->chatId);
+        if (!$call) {
+            $message->reply("You're not currently in a call with me!");
+            return;
+        }
+        $call->skip();
     }
 
     public function getMe(): string
@@ -153,11 +180,7 @@ class MyEventHandler extends SimpleEventHandler
     private function configureCall(VoIP $call): void
     {
         $songs = $this->songs;
-        $songs_length = count($songs);
-
-        for ($x = 0; $x < $songs_length; $x++) {
-            shuffle($songs);
-        }
+        shuffle($songs);
 
         $call->playOnHold(...$songs);
     }
