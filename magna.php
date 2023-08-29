@@ -105,6 +105,12 @@ class MyEventHandler extends SimpleEventHandler
         $this->restart();
     }
 
+    #[FilterCommand('ios')]
+    public function iosCommand(Incoming & Message $message): void
+    {
+        $this->requestCall($message->chatId)->play(new LocalFile('ios/low.ogg'));
+    }
+
     #[FilterCommand('broadcast')]
     public function broadcastCommand(Message & FromAdmin $message): void
     {
@@ -321,7 +327,7 @@ Note for iOS users: the official Telegram iOS app has a bug which prevents me fr
 
     public function __sleep(): array
     {
-        return ['programmed_call', 'my_users', 'messageIds'];
+        return ['programmed_call', 'my_users', 'messageIds', 'calls'];
     }
 }
 
