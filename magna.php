@@ -70,7 +70,7 @@ class MyEventHandler extends SimpleEventHandler
             try {
                 Ogg::validateOgg($song);
             } catch (Throwable $e) {
-                throw new AssertionError("An error occurred during validation of $song, please convert the file using convert.php or @libtgvoipbot!", 0, $e);
+                throw new AssertionError("An error occurred during validation of {$song->file}, please convert the file using convert.php or @libtgvoipbot!", 0, $e);
             }
         }
         $this->songs = $songs;
