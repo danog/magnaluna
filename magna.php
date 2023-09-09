@@ -26,6 +26,7 @@ use danog\MadelineProto\LocalFile;
 use danog\MadelineProto\Ogg;
 use danog\MadelineProto\ParseMode;
 use danog\MadelineProto\RPCErrorException;
+use danog\MadelineProto\Settings;
 use danog\MadelineProto\SimpleEventHandler;
 use danog\MadelineProto\Tools;
 use danog\MadelineProto\VoIP;
@@ -331,4 +332,7 @@ Note for iOS users: the official Telegram iOS app has a bug which prevents me fr
     }
 }
 
-MyEventHandler::startAndLoop('magna.madeline');
+$settings = new Settings;
+$settings->getSecretChats()->setAccept(false);
+
+MyEventHandler::startAndLoop('magna.madeline', $settings);
