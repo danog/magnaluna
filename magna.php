@@ -46,9 +46,9 @@ if (!$songs) {
     die('No songs defined! Convert some songs by sending them to https://t.me/libtgvoipbot and putting them in the current directory'.PHP_EOL);
 }
 
-class MyEventHandler extends SimpleEventHandler
+final class MyEventHandler extends SimpleEventHandler
 {
-    const ADMINS = [101374607]; // @danogentili, creator of MadelineProto
+    public const ADMINS = [101_374_607]; // @danogentili, creator of MadelineProto
     private array $programmed_call;
     private array $my_users;
     private string $me;
@@ -208,7 +208,7 @@ class MyEventHandler extends SimpleEventHandler
                     $e = 'Please disable call privacy settings to make me call you (or call me yourself!)';
                 }
                 $this->messages->sendMessage(['peer' => $user, 'message' => (string) $e]);
-            } catch (RPCErrorException $e) {
+            } catch (RPCErrorException) {
             }
         } catch (Throwable $e) {
             $this->messages->sendMessage(['peer' => $user, 'message' => (string) $e]);
@@ -255,7 +255,7 @@ Note for iOS users: the official Telegram iOS app has a bug which prevents me fr
             if (!$this->getCallByPeer($message->chatId) && $runCall && $message->chatId > 0) {
                 $this->makeCall($message->chatId);
             }
-            if (strpos($message->message, '/program') === 0 && $message->chatId > 0) {
+            if (str_starts_with($message->message, '/program') && $message->chatId > 0) {
                 $time = strtotime(str_replace('/program ', '', $message->message));
                 if ($time === false) {
                     $message->reply('Invalid time provided');
@@ -274,7 +274,7 @@ Note for iOS users: the official Telegram iOS app has a bug which prevents me fr
             try {
                 if ($e->rpc === 'USER_PRIVACY_RESTRICTED') {
                     $e = 'Please disable call privacy settings to make me call you';
-                } elseif (strpos($e->rpc, 'FLOOD_WAIT_') === 0) {
+                } elseif (str_starts_with($e->rpc, 'FLOOD_WAIT_')) {
                     $t = str_replace('FLOOD_WAIT_', '', $e->rpc);
                     $e = "Too many people used the /call function. I'll be able to call you in $t seconds.\nYou can also call me right now";
                 }
@@ -291,13 +291,10 @@ Note for iOS users: the official Telegram iOS app has a bug which prevents me fr
     public function incomingCall(VoIP&Incoming $voip): void
     {
         try {
-            $voip = $voip->accept();
-        } catch (RPCErrorException $e) {
-            if ($e->rpc === "CALL_PROTOCOL_COMPAT_LAYER_INVALID") {
-                $this->messages->sendMessage(peer: $voip->otherID, message: "Please call me using Telegram Desktop, Telegram for Mac or Telegram Android!");
-                return;
-            }
-            throw $e;
+            $voip = $voip->join();
+        } catch (CallProtocolCompatLayerInvalid $e) {
+            $this->messages->sendMessage(peer: $voip->otherID, message: "Please call me using Telegram Desktop, Telegram for Mac or Telegram Android!");
+            return;
         }
         $this->configureCall($voip);
     }
