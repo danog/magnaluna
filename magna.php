@@ -11,18 +11,17 @@
 
 declare(strict_types=1);
 
-use danog\MadelineProto\API;
 use danog\MadelineProto\Broadcast\Progress;
 use danog\MadelineProto\Broadcast\Status;
+use danog\MadelineProto\CallNotAllowedException;
 use danog\MadelineProto\EventHandler\Attributes\Cron;
 use danog\MadelineProto\EventHandler\Attributes\Handler;
 use danog\MadelineProto\EventHandler\Call;
-use danog\MadelineProto\EventHandler\Calls\GroupCall;
 use danog\MadelineProto\EventHandler\Calls\PrivateCall;
 use danog\MadelineProto\EventHandler\Filter\FilterCommand;
 use danog\MadelineProto\EventHandler\Message;
+use danog\MadelineProto\EventHandler\Message\GroupMessage;
 use danog\MadelineProto\EventHandler\Message\PrivateMessage;
-use danog\MadelineProto\EventHandler\Message\Service\DialogGroupCall\GroupCall as GroupCallStarted;
 use danog\MadelineProto\EventHandler\SimpleFilter\Ended;
 use danog\MadelineProto\EventHandler\SimpleFilter\FromAdmin;
 use danog\MadelineProto\EventHandler\SimpleFilter\Incoming;
@@ -31,7 +30,6 @@ use danog\MadelineProto\Exception;
 use danog\MadelineProto\LocalFile;
 use danog\MadelineProto\MediaDestination;
 use danog\MadelineProto\ParseMode;
-use danog\MadelineProto\RPCError\RateLimitError;
 use danog\MadelineProto\RPCErrorException;
 use danog\MadelineProto\Settings;
 use danog\MadelineProto\SimpleEventHandler;
@@ -82,9 +80,6 @@ final class MyEventHandler extends SimpleEventHandler
                 unset($this->programmed_call[$key]);
             });
         }
-
-        // Join (or start) the video chats of our groups.
-        Tools::callFork($this->startGroupCalls(...));
     }
 
     /**
@@ -96,89 +91,18 @@ final class MyEventHandler extends SimpleEventHandler
     }
 
     /**
-     * Join a video chat (unless we are already in it, or nothing can be transmitted in it), and play the video.
+     * Join the video chat of a group (starting one if none is running and we may), and play the video.
      */
-    private function autoJoinGroupCall(GroupCall $call): void
+    #[FilterCommand('videochat')]
+    public function videoChatCommand(Incoming&GroupMessage $message): void
     {
-        if ($call->discarded || $call->scheduleDate !== null || $call->rtmpStream || $call->isJoined()) {
-            return;
-        }
-        $this->logger("Joining $call");
-        $this->broadcast($call->join());
-    }
-
-    /**
-     * Whether we may start a video chat in a group: we must be its creator, or an admin with the manage_call right.
-     */
-    private function canStartGroupCall(int $id): bool
-    {
-        $chat = $this->getInfo($id)['Chat'] ?? [];
-        return !($chat['left'] ?? false)
-            && !($chat['deactivated'] ?? false)
-            && (($chat['creator'] ?? false) || ($chat['admin_rights']['manage_call'] ?? false));
-    }
-
-    /**
-     * Join the video chat of every group we are a member of, starting one where none is running, if we may.
-     *
-     * Also run periodically, for the groups we are added to, and the video chats that ended.
-     */
-    #[Cron(period: 600)]
-    public function startGroupCalls(): void
-    {
-        foreach ($this->getDialogIds() as $id) {
-            for ($attempt = 0; $attempt < 3; $attempt++) {
-                try {
-                    if (!in_array($this->getType($id), [API::PEER_TYPE_GROUP, API::PEER_TYPE_SUPERGROUP], true)) {
-                        break;
-                    }
-                    $call = $this->getGroupCall($id);
-                    if ($call === null && $this->canStartGroupCall($id)) {
-                        $this->logger("Starting a video chat in $id");
-                        $call = $this->createGroupCall($id);
-                    }
-                    if ($call !== null) {
-                        $this->autoJoinGroupCall($call);
-                    }
-                    break;
-                } catch (RateLimitError $e) {
-                    // Wait, and try again.
-                    $e->wait();
-                } catch (Throwable $e) {
-                    $this->logger("Could not join the video chat of $id: $e");
-                    break;
-                }
-            }
-        }
-    }
-
-    /**
-     * Join video chats as soon as they start in our groups.
-     */
-    #[Handler]
-    public function groupCallStarted(GroupCallStarted $message): void
-    {
-        if ($message->ended || !in_array($this->getType($message->chatId), [API::PEER_TYPE_GROUP, API::PEER_TYPE_SUPERGROUP], true)) {
-            return;
-        }
-        if ($call = $this->getGroupCall($message->chatId)) {
-            $this->autoJoinGroupCall($call);
-        }
-    }
-
-    /**
-     * Join video chats whose updates we receive, if they are in one of our groups.
-     */
-    #[Handler]
-    public function groupCallUpdate(GroupCall $call): void
-    {
-        if ($call->discarded || $call->isJoined() || $call->peerId === null
-            || !in_array($this->getType($call->peerId), [API::PEER_TYPE_GROUP, API::PEER_TYPE_SUPERGROUP], true)
-        ) {
-            return;
-        }
-        if ($call = $this->getGroupCall($call->peerId)) {
-            $this->autoJoinGroupCall($call);
+        try {
+            $this->broadcast($message->requestCall()->join());
+            $message->reply('Playing in the video chat!');
+        } catch (CallNotAllowedException $e) {
+            $message->reply("I can't start a video chat here: {$e->reason->value}");
+        } catch (Throwable $e) {
+            $message->reply("Could not join the video chat: {$e->getMessage()}");
         }
     }
 
@@ -317,7 +241,7 @@ final class MyEventHandler extends SimpleEventHandler
 Call _me_ to watch an **awesome** video, or send /call to make _me_ call _you_ (don't forget to disable call privacy settings!).
 
 Send me the link of a video chat or a conference call, and I'll join it too!
-I also join the video chats of all the groups I'm in: add me to your group and start one!
+Add me to your group and send /videochat to make me join its video chat (or start one, if I'm allowed to)!
 
 You can also program a phone call with /program:
 

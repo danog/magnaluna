@@ -7,7 +7,7 @@ Telegram video webradio based on [MadelineProto](https://github.com/danog/Madeli
 It plays a video in:
 - one-to-one video calls (call it, or send it /call to make it call you);
 - video chats and end-to-end encrypted conference calls, whose links you send it;
-- the video chats of every group it is a member of, joining them as soon as they start.  
+- the video chats of the groups it's added to, when you send it /videochat (it also starts one, if it may).  
 
 ![Screenshot](https://github.com/danog/magnaluna/raw/master/screenshot.png)
 
