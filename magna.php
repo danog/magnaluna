@@ -514,8 +514,6 @@ I also provide advanced stats during calls!
 I'm a userbot powered by @MadelineProto, created by @danogentili.
 
 Source code: https://github.com/danog/MadelineProto
-
-Propic art by magnaluna on [deviantart](https://magnaluna.deviantart.com).
 ",
                     parseMode: ParseMode::MARKDOWN,
                     noWebpage: true
