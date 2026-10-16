@@ -64,8 +64,8 @@ final class MyEventHandler extends SimpleEventHandler
     private const CONFERENCE_LINK = '~(?:https?://)?(?:t|telegram)\.me/call/([\w-]+)~i';
     /** Video chat and livestream links: https://t.me/<username>?videochat (or ?livestream, ?voicechat), with an optional invite hash. */
     private const GROUP_CALL_LINK = '~(?:https?://)?(?:t|telegram)\.me/(\w{4,})\?(?:videochat|livestream|voicechat)(?:=([\w-]+))?~i';
-    /** Playlist commands sent in the chat of a video chat or conference call. */
-    private const CALL_CHAT_COMMAND = '~^[/!.](play|loop|skip)(?:@\w+)?(?:\s+(\S+))?~';
+    /** Commands sent in the chat of a video chat or conference call. */
+    private const CALL_CHAT_COMMAND = '~^[/!.](play|loop|skip|leave)(?:@\w+)?(?:\s+(\S+))?~';
 
     private array $programmed_call;
     private array $my_users;
@@ -269,7 +269,7 @@ final class MyEventHandler extends SimpleEventHandler
     }
 
     /**
-     * Handle the playlist commands sent in the chat of a video chat or conference call (only URLs can be sent there).
+     * Handle the commands sent in the chat of a video chat or conference call (only URLs can be sent there).
      */
     #[Handler]
     public function callChatCommand(MultiCallMessage $message): void
@@ -278,6 +278,11 @@ final class MyEventHandler extends SimpleEventHandler
             || !preg_match(self::CALL_CHAT_COMMAND, $message->message->text, $matches)
             || !$call = $this->getMultiCall($message->callId)
         ) {
+            return;
+        }
+        if ($matches[1] === 'leave') {
+            $call->sendMessage('Bye!');
+            $call->leave();
             return;
         }
         $arg = $matches[2] ?? null;
@@ -312,6 +317,25 @@ final class MyEventHandler extends SimpleEventHandler
             $message->reply("I can't start a video chat here: {$e->reason->value}");
         } catch (Throwable $e) {
             $message->reply("Could not join the video chat: {$e->getMessage()}");
+        }
+    }
+
+    /**
+     * Leave the video chat of a group.
+     */
+    #[FilterCommand('leave')]
+    public function leaveCommand(Incoming&GroupMessage $message): void
+    {
+        $call = $this->getGroupCall($message->chatId);
+        if (!$call?->isJoined()) {
+            $message->reply($this->notInCall($message));
+            return;
+        }
+        try {
+            $call->leave();
+            $message->reply('Left the video chat! Send /videochat to make me join it again.');
+        } catch (Throwable $e) {
+            $message->reply("Could not leave the video chat: {$e->getMessage()}");
         }
     }
 
@@ -473,6 +497,8 @@ During a call, change what I play (in our private chat, in the group, or in the 
 /play - reply to a video or audio file (or send /play <URL>) to add it to the playlist
 /skip - skip the file being played
 /loop - reply to a file (or send /loop <URL>) to loop it instead of my video when the playlist is empty, send just /loop to loop nothing, /loop default to loop my video again
+
+Send /leave in the group or in the chat of the call to make me leave a video chat or conference call.
 
 You can also program a phone call with /program:
 

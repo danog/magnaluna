@@ -11,6 +11,7 @@ It plays a video in:
 
 During a call, `/play` (replying to a video or audio file, or with a URL) adds a file to the playlist, `/skip` skips the file being played, and `/loop` (replying to a file, or with a URL) changes the video looped when the playlist is empty: send just `/loop` to loop nothing, `/loop default` to loop the default video again.
 Send them in the private chat (for one-to-one calls and the calls joined with a link you sent), in the group (for its video chat) or in the chat of the call (URLs only); files are streamed, never downloaded.
+Send `/leave` in the group (for its video chat) or in the chat of the call to make it leave a video chat or conference call.
 
 ![Screenshot](https://github.com/danog/magnaluna/raw/master/screenshot.png)
 
