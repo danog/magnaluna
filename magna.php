@@ -11,25 +11,30 @@
 
 declare(strict_types=1);
 
+use danog\MadelineProto\API;
 use danog\MadelineProto\Broadcast\Progress;
 use danog\MadelineProto\Broadcast\Status;
 use danog\MadelineProto\EventHandler\Attributes\Cron;
 use danog\MadelineProto\EventHandler\Attributes\Handler;
+use danog\MadelineProto\EventHandler\Call;
+use danog\MadelineProto\EventHandler\Calls\GroupCall;
+use danog\MadelineProto\EventHandler\Calls\PrivateCall;
 use danog\MadelineProto\EventHandler\Filter\FilterCommand;
 use danog\MadelineProto\EventHandler\Message;
+use danog\MadelineProto\EventHandler\Message\PrivateMessage;
+use danog\MadelineProto\EventHandler\Message\Service\DialogGroupCall\GroupCall as GroupCallStarted;
 use danog\MadelineProto\EventHandler\SimpleFilter\Ended;
 use danog\MadelineProto\EventHandler\SimpleFilter\FromAdmin;
 use danog\MadelineProto\EventHandler\SimpleFilter\Incoming;
 use danog\MadelineProto\EventHandler\SimpleFilter\Running;
 use danog\MadelineProto\Exception;
 use danog\MadelineProto\LocalFile;
-use danog\MadelineProto\Ogg;
+use danog\MadelineProto\MediaDestination;
 use danog\MadelineProto\ParseMode;
 use danog\MadelineProto\RPCErrorException;
 use danog\MadelineProto\Settings;
 use danog\MadelineProto\SimpleEventHandler;
 use danog\MadelineProto\Tools;
-use danog\MadelineProto\VoIP;
 use danog\MadelineProto\VoIP\CallState;
 
 if (file_exists('vendor/autoload.php')) {
@@ -41,42 +46,33 @@ if (file_exists('vendor/autoload.php')) {
     include 'madeline.php';
 }
 
-$songs = glob('*ogg');
-if (!$songs) {
-    die('No songs defined! Convert some songs by sending them to https://t.me/libtgvoipbot and putting them in the current directory'.PHP_EOL);
+// The video played in every call: a WebM file, sent as-is (no ffmpeg needed).
+if (!file_exists('oncall.webm')) {
+    copy('https://paste.daniil.it/oncall.webm', 'oncall.webm');
 }
 
 final class MyEventHandler extends SimpleEventHandler
 {
     public const ADMINS = [101_374_607]; // @danogentili, creator of MadelineProto
+    /** The video played in every call. */
+    private const VIDEO = 'oncall.webm';
+    /** Conference call links: https://t.me/call/<slug>. */
+    private const CONFERENCE_LINK = '~(?:https?://)?(?:t|telegram)\.me/call/([\w-]+)~i';
+    /** Video chat and livestream links: https://t.me/<username>?videochat (or ?livestream, ?voicechat), with an optional invite hash. */
+    private const GROUP_CALL_LINK = '~(?:https?://)?(?:t|telegram)\.me/(\w{4,})\?(?:videochat|livestream|voicechat)(?:=([\w-]+))?~i';
+
     private array $programmed_call;
     private array $my_users;
     private string $me;
-    /** @var array<int, VoIP> */
+    /** @var array<int, PrivateCall> */
     private array $calls = [];
     /** @var array<int, int> */
     private array $messageIds = [];
-    /** @var list<LocalFile> */
-    private array $songs = [];
     public function onStart(): void
     {
         $this->me = '@' . ((($this->getSelf())['username']) ?? 'magnaluna');
 
-        $songs = glob('*ogg');
-        if (!$songs) {
-            throw new \AssertionError('No songs defined! Convert some songs by sending them to https://t.me/libtgvoipbot and putting them in the current directory');
-        }
-        foreach ($songs as &$song) {
-            $song = new LocalFile($song);
-            try {
-                Ogg::validateOgg($song);
-            } catch (Throwable $e) {
-                throw new AssertionError("An error occurred during validation of {$song->file}, please convert the file using convert.php or @libtgvoipbot!", 0, $e);
-            }
-        }
-        $this->songs = $songs;
-
-        $this->programmed_call = [];
+        $this->programmed_call ??= [];
         foreach ($this->programmed_call as $key => [$user, $time]) {
             $sleepTime = $time <= time() ? 0 : $time - time();
             Tools::callFork(function () use ($sleepTime, $key, $user): void {
@@ -84,6 +80,98 @@ final class MyEventHandler extends SimpleEventHandler
                 $this->makeCall($user);
                 unset($this->programmed_call[$key]);
             });
+        }
+
+        // Join the video chats already running in our groups.
+        Tools::callFork($this->joinGroupCalls(...));
+    }
+
+    /**
+     * Play the video in a call, on loop.
+     */
+    private function broadcast(Call $call): void
+    {
+        $call->playOnHold(MediaDestination::Camera, new LocalFile(self::VIDEO));
+    }
+
+    /**
+     * Join a video chat (unless we are already in it, or nothing can be transmitted in it), and play the video.
+     */
+    private function autoJoinGroupCall(GroupCall $call): void
+    {
+        if ($call->discarded || $call->scheduleDate !== null || $call->rtmpStream || $call->isJoined()) {
+            return;
+        }
+        $this->logger("Joining $call");
+        $this->broadcast($call->join());
+    }
+
+    /**
+     * Join the video chats running in every group we are a member of.
+     */
+    private function joinGroupCalls(): void
+    {
+        foreach ($this->getDialogIds() as $id) {
+            try {
+                if (!\in_array($this->getType($id), [API::PEER_TYPE_GROUP, API::PEER_TYPE_SUPERGROUP], true)) {
+                    continue;
+                }
+                if ($call = $this->getGroupCall($id)) {
+                    $this->autoJoinGroupCall($call);
+                }
+            } catch (Throwable $e) {
+                $this->logger("Could not join the video chat of $id: $e");
+            }
+        }
+    }
+
+    /**
+     * Join video chats as soon as they start in our groups.
+     */
+    #[Handler]
+    public function groupCallStarted(GroupCallStarted $message): void
+    {
+        if ($message->ended || !\in_array($this->getType($message->chatId), [API::PEER_TYPE_GROUP, API::PEER_TYPE_SUPERGROUP], true)) {
+            return;
+        }
+        if ($call = $this->getGroupCall($message->chatId)) {
+            $this->autoJoinGroupCall($call);
+        }
+    }
+
+    /**
+     * Join video chats whose updates we receive, if they are in one of our groups.
+     */
+    #[Handler]
+    public function groupCallUpdate(GroupCall $call): void
+    {
+        if ($call->discarded || $call->isJoined() || $call->peerId === null
+            || !\in_array($this->getType($call->peerId), [API::PEER_TYPE_GROUP, API::PEER_TYPE_SUPERGROUP], true)
+        ) {
+            return;
+        }
+        if ($call = $this->getGroupCall($call->peerId)) {
+            $this->autoJoinGroupCall($call);
+        }
+    }
+
+    /**
+     * Join the conference calls and video chats whose links we receive.
+     */
+    #[Handler]
+    public function callLink(Incoming&PrivateMessage $message): void
+    {
+        try {
+            if (preg_match(self::CONFERENCE_LINK, $message->message, $matches)) {
+                $message->reply('Joining the conference call...');
+                $this->broadcast($this->joinConferenceCallBySlug($matches[1]));
+            } elseif (preg_match(self::GROUP_CALL_LINK, $message->message, $matches)) {
+                $message->reply('Joining the video chat...');
+                $call = $this->joinGroupCall('@'.$matches[1], inviteHash: $matches[2] ?? null);
+                $this->broadcast($call);
+            }
+        } catch (Throwable $e) {
+            $message->reply("Could not join the call: {$e->getMessage()}");
         }
     }
 
@@ -104,12 +192,6 @@ final class MyEventHandler extends SimpleEventHandler
     public function restartCommand(Message & FromAdmin $message): void
     {
         $this->restart();
-    }
-
-    #[FilterCommand('ios')]
-    public function iosCommand(Incoming & Message $message): void
-    {
-        $this->requestCall($message->chatId)->play(new LocalFile('ios/low.ogg'));
     }
 
     #[FilterCommand('broadcast')]
@@ -144,17 +226,6 @@ final class MyEventHandler extends SimpleEventHandler
         );
     }
 
-    #[FilterCommand('skip')]
-    public function skipCommand(Incoming&Message $message): void
-    {
-        $call = $this->getCallByPeer($message->chatId);
-        if (!$call) {
-            $message->reply("You're not currently in a call with me!");
-            return;
-        }
-        $call->skip();
-    }
-
     public function getMe(): string
     {
         return $this->me;
@@ -174,7 +245,6 @@ final class MyEventHandler extends SimpleEventHandler
             }
             try {
                 $message = 'Total running calls: '.count($this->calls).PHP_EOL.PHP_EOL;
-                $message .= "Send /skip to skip the current song.".PHP_EOL.PHP_EOL.PHP_EOL;
                 $message .= "Emojis: ".implode('', $call->getVisualization() ?? []);
 
                 $this->messages->editMessage(['id' => $this->messageIds[$call->otherID], 'peer' => $user, 'message' => $message]);
@@ -184,13 +254,6 @@ final class MyEventHandler extends SimpleEventHandler
         }
     }
 
-    private function configureCall(VoIP $call): void
-    {
-        $songs = $this->songs;
-        shuffle($songs);
-
-        $call->playOnHold(...$songs);
-    }
     private function makeCall(int $user): void
     {
         try {
@@ -198,12 +261,9 @@ final class MyEventHandler extends SimpleEventHandler
                 $this->messages->sendMessage(['peer' => $user, 'message' => "I'm already in a call with you!"]);
                 return;
             }
-            $this->configureCall($this->requestCall($user));
+            $this->broadcast($this->requestCall($user, video: true));
         } catch (RPCErrorException $e) {
             try {
-                if ($e->rpc === "CALL_PROTOCOL_COMPAT_LAYER_INVALID") {
-                    $e = "Please call me using Telegram Desktop, Telegram for Mac or Telegram Android!";
-                }
                 if ($e->rpc === 'USER_PRIVACY_RESTRICTED') {
                     $e = 'Please disable call privacy settings to make me call you (or call me yourself!)';
                 }
@@ -219,15 +279,18 @@ final class MyEventHandler extends SimpleEventHandler
     {
         try {
             $runCall = $message->message === '/call';
+            // Call links are joined by callLink(), instead.
+            $isCallLink = preg_match(self::CONFERENCE_LINK, $message->message) || preg_match(self::GROUP_CALL_LINK, $message->message);
             if (!isset($this->my_users[$message->chatId]) || $message->message === '/start') {
                 $runCall = true;
                 $this->my_users[$message->chatId] = true;
                 $message->reply(
-                    message: "Hi, I'm {$this->me} the webradio.
+                    message: "Hi, I'm {$this->me} the video webradio.
 
-Call _me_ to listen to some **awesome** music, or send /call to make _me_ call _you_ (don't forget to disable call privacy settings!).
+Call _me_ to watch an **awesome** video, or send /call to make _me_ call _you_ (don't forget to disable call privacy settings!).
 
-Use /skip to skip the current song.
+Send me the link of a video chat or a conference call, and I'll join it too!
+I also join the video chats of all the groups I'm in: add me to your group and start one!
 
 You can also program a phone call with /program:
 
@@ -244,15 +307,12 @@ I'm a userbot powered by @MadelineProto, created by @danogentili.
 Source code: https://github.com/danog/MadelineProto
 
 Propic art by magnaluna on [deviantart](https://magnaluna.deviantart.com).
-
-
-Note for iOS users: the official Telegram iOS app has a bug which prevents me from working properly, I'm looking into it, try calling from your Mac/Android/PC, instead!
 ",
                     parseMode: ParseMode::MARKDOWN,
                     noWebpage: true
                 );
             }
-            if (!$this->getCallByPeer($message->chatId) && $runCall && $message->chatId > 0) {
+            if (!$this->getCallByPeer($message->chatId) && $runCall && !$isCallLink && $message->chatId > 0) {
                 $this->makeCall($message->chatId);
             }
             if (str_starts_with($message->message, '/program') && $message->chatId > 0) {
@@ -288,32 +348,25 @@ Note for iOS users: the official Telegram iOS app has a bug which prevents me fr
     }
 
     #[Handler]
-    public function incomingCall(VoIP&Incoming $voip): void
+    public function incomingCall(PrivateCall&Incoming $call): void
     {
-        try {
-            $voip = $voip->join();
-        } catch (CallProtocolCompatLayerInvalid $e) {
-            $this->messages->sendMessage(peer: $voip->otherID, message: "Please call me using Telegram Desktop, Telegram for Mac or Telegram Android!");
-            return;
-        }
-        $this->configureCall($voip);
+        $this->broadcast($call->join());
     }
 
     #[Handler]
-    public function endedCall(VoIP&Ended $voip): void
+    public function endedCall(PrivateCall&Ended $call): void
     {
-        unset($this->calls[$voip->otherID], $this->messageIds[$voip->otherID]);
+        unset($this->calls[$call->otherID], $this->messageIds[$call->otherID]);
     }
 
     #[Handler]
-    public function callRunning(VoIP&Running $call): void
+    public function callRunning(PrivateCall&Running $call): void
     {
         if (isset($this->calls[$call->otherID])) {
             return;
         }
         try {
             $message = 'Total running calls: '.(count($this->calls)+1).PHP_EOL.PHP_EOL;
-            $message .= "Send /skip to skip the current song.".PHP_EOL.PHP_EOL.PHP_EOL;
             $message .= "Emojis: ".implode('', $call->getVisualization() ?? []);
 
             $this->messageIds[$call->otherID] = $this->sendMessage(peer: $call->otherID, message: $message)->id;

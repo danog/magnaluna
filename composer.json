@@ -1,6 +1,6 @@
 {
     "name": "danog/magnaluna",
-    "description": "Telegram webradio based on MadelineProto and libtgvoip",
+    "description": "Telegram video webradio based on MadelineProto",
     "authors": [{
         "name": "Daniil Gentili",
         "email": "daniil@daniil.it"
@@ -11,7 +11,7 @@
     },
     "minimum-stability": "beta",
     "require": {
-        "danog/madelineproto": "^8.0.0-beta133"
+        "danog/madelineproto": "^8.8.8"
     },
     "license": "AGPL-3.0-only",
     "require-dev": {
