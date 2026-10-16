@@ -31,6 +31,7 @@ use danog\MadelineProto\Exception;
 use danog\MadelineProto\LocalFile;
 use danog\MadelineProto\MediaDestination;
 use danog\MadelineProto\ParseMode;
+use danog\MadelineProto\RPCError\RateLimitError;
 use danog\MadelineProto\RPCErrorException;
 use danog\MadelineProto\Settings;
 use danog\MadelineProto\SimpleEventHandler;
@@ -82,8 +83,8 @@ final class MyEventHandler extends SimpleEventHandler
             });
         }
 
-        // Join the video chats already running in our groups.
-        Tools::callFork($this->joinGroupCalls(...));
+        // Join (or start) the video chats of our groups.
+        Tools::callFork($this->startGroupCalls(...));
     }
 
     /**
@@ -107,20 +108,46 @@ final class MyEventHandler extends SimpleEventHandler
     }
 
     /**
-     * Join the video chats running in every group we are a member of.
+     * Whether we may start a video chat in a group: we must be its creator, or an admin with the manage_call right.
      */
-    private function joinGroupCalls(): void
+    private function canStartGroupCall(int $id): bool
+    {
+        $chat = $this->getInfo($id)['Chat'] ?? [];
+        return !($chat['left'] ?? false)
+            && !($chat['deactivated'] ?? false)
+            && (($chat['creator'] ?? false) || ($chat['admin_rights']['manage_call'] ?? false));
+    }
+
+    /**
+     * Join the video chat of every group we are a member of, starting one where none is running, if we may.
+     *
+     * Also run periodically, for the groups we are added to, and the video chats that ended.
+     */
+    #[Cron(period: 600)]
+    public function startGroupCalls(): void
     {
         foreach ($this->getDialogIds() as $id) {
-            try {
-                if (!\in_array($this->getType($id), [API::PEER_TYPE_GROUP, API::PEER_TYPE_SUPERGROUP], true)) {
-                    continue;
+            for ($attempt = 0; $attempt < 3; $attempt++) {
+                try {
+                    if (!in_array($this->getType($id), [API::PEER_TYPE_GROUP, API::PEER_TYPE_SUPERGROUP], true)) {
+                        break;
+                    }
+                    $call = $this->getGroupCall($id);
+                    if ($call === null && $this->canStartGroupCall($id)) {
+                        $this->logger("Starting a video chat in $id");
+                        $call = $this->createGroupCall($id);
+                    }
+                    if ($call !== null) {
+                        $this->autoJoinGroupCall($call);
+                    }
+                    break;
+                } catch (RateLimitError $e) {
+                    // Wait, and try again.
+                    $e->wait();
+                } catch (Throwable $e) {
+                    $this->logger("Could not join the video chat of $id: $e");
+                    break;
                 }
-                if ($call = $this->getGroupCall($id)) {
-                    $this->autoJoinGroupCall($call);
-                }
-            } catch (Throwable $e) {
-                $this->logger("Could not join the video chat of $id: $e");
             }
         }
     }
@@ -131,7 +158,7 @@ final class MyEventHandler extends SimpleEventHandler
     #[Handler]
     public function groupCallStarted(GroupCallStarted $message): void
     {
-        if ($message->ended || !\in_array($this->getType($message->chatId), [API::PEER_TYPE_GROUP, API::PEER_TYPE_SUPERGROUP], true)) {
+        if ($message->ended || !in_array($this->getType($message->chatId), [API::PEER_TYPE_GROUP, API::PEER_TYPE_SUPERGROUP], true)) {
             return;
         }
         if ($call = $this->getGroupCall($message->chatId)) {
@@ -146,7 +173,7 @@ final class MyEventHandler extends SimpleEventHandler
     public function groupCallUpdate(GroupCall $call): void
     {
         if ($call->discarded || $call->isJoined() || $call->peerId === null
-            || !\in_array($this->getType($call->peerId), [API::PEER_TYPE_GROUP, API::PEER_TYPE_SUPERGROUP], true)
+            || !in_array($this->getType($call->peerId), [API::PEER_TYPE_GROUP, API::PEER_TYPE_SUPERGROUP], true)
         ) {
             return;
         }
