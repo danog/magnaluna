@@ -20,6 +20,7 @@ use danog\MadelineProto\EventHandler\Attributes\Handler;
 use danog\MadelineProto\EventHandler\Call;
 use danog\MadelineProto\EventHandler\Calls\MultiCallMessage;
 use danog\MadelineProto\EventHandler\Calls\PrivateCall;
+use danog\MadelineProto\EventHandler\Filter\Combinator\FiltersOr;
 use danog\MadelineProto\EventHandler\Filter\FilterCommand;
 use danog\MadelineProto\EventHandler\Media;
 use danog\MadelineProto\EventHandler\Message;
@@ -265,7 +266,7 @@ final class MyEventHandler extends SimpleEventHandler
     {
         return $message->chatId > 0
             ? "We're not in a call: call me, send /call, or send me the link of a video chat or conference call first!"
-            : "I'm not in this group's video chat: send /videochat first!";
+            : "I'm not in this group's video chat: send /join first!";
     }
 
     /**
@@ -307,8 +308,8 @@ final class MyEventHandler extends SimpleEventHandler
     /**
      * Join the video chat of a group (starting one if none is running and we may), and play the video.
      */
-    #[FilterCommand('videochat')]
-    public function videoChatCommand(Incoming&GroupMessage $message): void
+    #[FiltersOr(new FilterCommand('join'), new FilterCommand('videochat'))]
+    public function joinCommand(Incoming&GroupMessage $message): void
     {
         try {
             $this->broadcast($message->requestCall()->join());
@@ -333,7 +334,7 @@ final class MyEventHandler extends SimpleEventHandler
         }
         try {
             $call->leave();
-            $message->reply('Left the video chat! Send /videochat to make me join it again.');
+            $message->reply('Left the video chat! Send /join to make me join it again.');
         } catch (Throwable $e) {
             $message->reply("Could not leave the video chat: {$e->getMessage()}");
         }
@@ -491,7 +492,7 @@ final class MyEventHandler extends SimpleEventHandler
 Call _me_ to watch an **awesome** video, or send /call to make _me_ call _you_ (don't forget to disable call privacy settings!).
 
 Send me the link of a video chat or a conference call, and I'll join it too!
-Add me to your group and send /videochat to make me join its video chat (or start one, if I'm allowed to)!
+Add me to your group and send /join to make me join its video chat (or start one, if I'm allowed to)!
 
 During a call, change what I play (in our private chat, in the group, or in the chat of the call):
 /play - reply to a video or audio file (or send /play <URL>) to add it to the playlist
