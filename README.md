@@ -7,7 +7,10 @@ Telegram video webradio based on [MadelineProto](https://github.com/danog/Madeli
 It plays a video in:
 - one-to-one video calls (call it, or send it /call to make it call you);
 - video chats and end-to-end encrypted conference calls, whose links you send it;
-- the video chats of the groups it's added to, when you send it /videochat (it also starts one, if it may).  
+- the video chats of the groups it's added to, when you send it /videochat (it also starts one, if it may).
+
+During a call, `/play` (replying to a video or audio file, or with a URL) adds a file to the playlist, `/skip` skips the file being played, and `/loop` (replying to a file, or with a URL) changes the video looped when the playlist is empty: send just `/loop` to loop nothing, `/loop default` to loop the default video again.
+Send them in the private chat (for one-to-one calls and the calls joined with a link you sent), in the group (for its video chat) or in the chat of the call (URLs only); files are streamed, never downloaded.
 
 ![Screenshot](https://github.com/danog/magnaluna/raw/master/screenshot.png)
 

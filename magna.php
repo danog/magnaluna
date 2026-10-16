@@ -11,17 +11,21 @@
 
 declare(strict_types=1);
 
+use Amp\ByteStream\ReadableStream;
 use danog\MadelineProto\Broadcast\Progress;
 use danog\MadelineProto\Broadcast\Status;
 use danog\MadelineProto\CallNotAllowedException;
 use danog\MadelineProto\EventHandler\Attributes\Cron;
 use danog\MadelineProto\EventHandler\Attributes\Handler;
 use danog\MadelineProto\EventHandler\Call;
+use danog\MadelineProto\EventHandler\Calls\MultiCallMessage;
 use danog\MadelineProto\EventHandler\Calls\PrivateCall;
 use danog\MadelineProto\EventHandler\Filter\FilterCommand;
+use danog\MadelineProto\EventHandler\Media;
 use danog\MadelineProto\EventHandler\Message;
 use danog\MadelineProto\EventHandler\Message\GroupMessage;
 use danog\MadelineProto\EventHandler\Message\PrivateMessage;
+use danog\MadelineProto\EventHandler\MultiCall;
 use danog\MadelineProto\EventHandler\SimpleFilter\Ended;
 use danog\MadelineProto\EventHandler\SimpleFilter\FromAdmin;
 use danog\MadelineProto\EventHandler\SimpleFilter\Incoming;
@@ -30,6 +34,7 @@ use danog\MadelineProto\Exception;
 use danog\MadelineProto\LocalFile;
 use danog\MadelineProto\MediaDestination;
 use danog\MadelineProto\ParseMode;
+use danog\MadelineProto\RemoteUrl;
 use danog\MadelineProto\RPCErrorException;
 use danog\MadelineProto\Settings;
 use danog\MadelineProto\SimpleEventHandler;
@@ -59,17 +64,28 @@ final class MyEventHandler extends SimpleEventHandler
     private const CONFERENCE_LINK = '~(?:https?://)?(?:t|telegram)\.me/call/([\w-]+)~i';
     /** Video chat and livestream links: https://t.me/<username>?videochat (or ?livestream, ?voicechat), with an optional invite hash. */
     private const GROUP_CALL_LINK = '~(?:https?://)?(?:t|telegram)\.me/(\w{4,})\?(?:videochat|livestream|voicechat)(?:=([\w-]+))?~i';
+    /** Playlist commands sent in the chat of a video chat or conference call. */
+    private const CALL_CHAT_COMMAND = '~^[/!.](play|loop|skip)(?:@\w+)?(?:\s+(\S+))?~';
 
     private array $programmed_call;
     private array $my_users;
     private string $me;
+    private int $myId;
     /** @var array<int, PrivateCall> */
     private array $calls = [];
     /** @var array<int, int> */
     private array $messageIds = [];
+    /**
+     * The video chat or conference call each user last made us join with a link, to control it from their private chat.
+     *
+     * @var array<int, int>
+     */
+    private array $linkedCalls = [];
     public function onStart(): void
     {
-        $this->me = '@' . ((($this->getSelf())['username']) ?? 'magnaluna');
+        $self = $this->getSelf();
+        $this->me = '@' . ($self['username'] ?? 'magnaluna');
+        $this->myId = $self['id'];
 
         $this->programmed_call ??= [];
         foreach ($this->programmed_call as $key => [$user, $time]) {
@@ -88,6 +104,199 @@ final class MyEventHandler extends SimpleEventHandler
     private function broadcast(Call $call): void
     {
         $call->playOnHold(MediaDestination::Camera, new LocalFile(self::VIDEO));
+    }
+
+    /**
+     * Get a video chat or conference call we're in, by its ID.
+     */
+    private function getMultiCall(int $id): ?MultiCall
+    {
+        $call = $this->getConferenceCall($id) ?? $this->getAllGroupCalls()[$id] ?? null;
+        return $call?->isJoined() ? $call : null;
+    }
+
+    /**
+     * The call controlled by the commands sent in a chat: our call with a user (or else the call they
+     * last made us join with a link), or the video chat of a group.
+     */
+    private function getCallFor(Message $message): ?Call
+    {
+        if ($message->chatId > 0) {
+            if ($call = $this->getCallByPeer($message->chatId)) {
+                return $call;
+            }
+            $id = $this->linkedCalls[$message->chatId] ?? null;
+            return $id === null ? null : $this->getMultiCall($id);
+        }
+        $call = $this->getGroupCall($message->chatId);
+        return $call?->isJoined() ? $call : null;
+    }
+
+    /**
+     * Parse the URL of a file to play.
+     */
+    private static function parseUrl(string $url): RemoteUrl
+    {
+        if (filter_var($url, FILTER_VALIDATE_URL) === false
+            || !in_array(strtolower((string) parse_url($url, PHP_URL_SCHEME)), ['http', 'https'], true)
+        ) {
+            throw new InvalidArgumentException("$url is not a valid http(s) URL!");
+        }
+        return new RemoteUrl($url);
+    }
+
+    /**
+     * How a Telegram file will be played: '' if entirely, a note if only partially.
+     */
+    private static function describeMedia(Media $media): string
+    {
+        $mime = $media->mimeType;
+        $ext = strtolower($media->fileExt);
+        if (in_array($mime, ['video/webm', 'video/x-matroska', 'audio/webm', 'audio/ogg', 'audio/opus'], true)
+            || in_array($ext, ['.webm', '.mkv', '.ogg', '.opus'], true)
+        ) {
+            return '';
+        }
+        $isVideo = str_starts_with($mime, 'video/');
+        // Anything else is converted with ffmpeg, which only plays its audio.
+        if (($isVideo || str_starts_with($mime, 'audio/')) && Tools::canConvertOgg()) {
+            return $isVideo ? ' (just its audio: send a WebM or MKV file with VP8, VP9, H.264 or H.265 video to play the video, too)' : '';
+        }
+        throw new InvalidArgumentException("I can't play this file: send me a WebM or MKV video (VP8, VP9, H.264 or H.265 with OPUS audio), or an audio file.");
+    }
+
+    /**
+     * The file a playlist command refers to, along with a note on how it will be played: the URL
+     * passed to it, the file it was sent with or the file it replies to (streamed, not downloaded);
+     * null if none.
+     *
+     * @return array{RemoteUrl|ReadableStream, string}|null
+     */
+    private function getFile(Message $message): ?array
+    {
+        if (isset($message->commandArgs[0])) {
+            return [self::parseUrl($message->commandArgs[0]), ''];
+        }
+        $media = $message->media;
+        if ($media === null && $message->replyToMsgId !== null) {
+            $media = $message->getReply(Message::class)?->media
+                ?? throw new InvalidArgumentException('The message you replied to has no file!');
+        }
+        if ($media === null) {
+            return null;
+        }
+        $note = self::describeMedia($media);
+        return [$media->getStream(), $note];
+    }
+
+    /**
+     * Add a file to the playlist of a call, interrupting the looped file.
+     */
+    private function enqueue(Call $call, LocalFile|RemoteUrl|ReadableStream $file, string $note): string
+    {
+        $call->then($file);
+        return "Added to the playlist$note! Send /skip to skip the file being played.";
+    }
+
+    /**
+     * Change (or remove, if null) the file looped in a call while its playlist is empty.
+     */
+    private function setLoop(Call $call, LocalFile|RemoteUrl|ReadableStream|null $file, string $note): string
+    {
+        if ($file === null) {
+            $call->playOnHold();
+            return 'Not looping anything anymore: nothing plays when the playlist is empty. Send /loop default to loop the default video again.';
+        }
+        $call->playOnHold(MediaDestination::Camera, $file);
+        return "Now looping this file$note when the playlist is empty!";
+    }
+
+    #[FilterCommand('play')]
+    public function playCommand(Incoming&Message $message): void
+    {
+        if (!$call = $this->getCallFor($message)) {
+            $message->reply($this->notInCall($message));
+            return;
+        }
+        try {
+            $file = $this->getFile($message);
+            $message->reply($file === null
+                ? 'Reply to a video or audio file with /play, or send /play <URL>, to add it to the playlist.'
+                : $this->enqueue($call, ...$file));
+        } catch (InvalidArgumentException $e) {
+            $message->reply($e->getMessage());
+        }
+    }
+
+    #[FilterCommand('loop')]
+    public function loopCommand(Incoming&Message $message): void
+    {
+        if (!$call = $this->getCallFor($message)) {
+            $message->reply($this->notInCall($message));
+            return;
+        }
+        try {
+            $file = ($message->commandArgs[0] ?? null) === 'default'
+                ? [new LocalFile(self::VIDEO), '']
+                : $this->getFile($message);
+            $message->reply($this->setLoop($call, $file[0] ?? null, $file[1] ?? ''));
+        } catch (InvalidArgumentException $e) {
+            $message->reply($e->getMessage());
+        }
+    }
+
+    #[FilterCommand('skip')]
+    public function skipCommand(Incoming&Message $message): void
+    {
+        if (!$call = $this->getCallFor($message)) {
+            $message->reply($this->notInCall($message));
+            return;
+        }
+        $message->reply($this->skip($call));
+    }
+
+    private function skip(Call $call): string
+    {
+        $call->skip();
+        return 'Skipped!';
+    }
+
+    private function notInCall(Message $message): string
+    {
+        return $message->chatId > 0
+            ? "We're not in a call: call me, send /call, or send me the link of a video chat or conference call first!"
+            : "I'm not in this group's video chat: send /videochat first!";
+    }
+
+    /**
+     * Handle the playlist commands sent in the chat of a video chat or conference call (only URLs can be sent there).
+     */
+    #[Handler]
+    public function callChatCommand(MultiCallMessage $message): void
+    {
+        if ($message->fromId === $this->myId
+            || !preg_match(self::CALL_CHAT_COMMAND, $message->message->text, $matches)
+            || !$call = $this->getMultiCall($message->callId)
+        ) {
+            return;
+        }
+        $arg = $matches[2] ?? null;
+        try {
+            $reply = match ($matches[1]) {
+                'play' => $arg === null
+                    ? 'Send /play <URL> to add a file to the playlist.'
+                    : $this->enqueue($call, self::parseUrl($arg), ''),
+                'loop' => $this->setLoop($call, match ($arg) {
+                    null => null,
+                    'default' => new LocalFile(self::VIDEO),
+                    default => self::parseUrl($arg),
+                }, ''),
+                'skip' => $this->skip($call),
+            };
+        } catch (InvalidArgumentException $e) {
+            $reply = $e->getMessage();
+        }
+        $call->sendMessage($reply);
     }
 
     /**
@@ -115,12 +324,16 @@ final class MyEventHandler extends SimpleEventHandler
         try {
             if (preg_match(self::CONFERENCE_LINK, $message->message, $matches)) {
                 $message->reply('Joining the conference call...');
-                $this->broadcast($this->joinConferenceCallBySlug($matches[1]));
+                $call = $this->joinConferenceCallBySlug($matches[1]);
             } elseif (preg_match(self::GROUP_CALL_LINK, $message->message, $matches)) {
                 $message->reply('Joining the video chat...');
                 $call = $this->joinGroupCall('@'.$matches[1], inviteHash: $matches[2] ?? null);
-                $this->broadcast($call);
+            } else {
+                return;
             }
+            $this->broadcast($call);
+            $this->linkedCalls[$message->chatId] = $call->id;
+            $message->reply('Joined! Send me /play, /loop and /skip here, or in the chat of the call, to change what I play there.');
         } catch (Throwable $e) {
             $message->reply("Could not join the call: {$e->getMessage()}");
         }
@@ -185,6 +398,19 @@ final class MyEventHandler extends SimpleEventHandler
     {
         return self::ADMINS;
     }
+    /**
+     * Forget the calls we left.
+     */
+    #[Cron(period: 3600)]
+    public function cleanup(): void
+    {
+        foreach ($this->linkedCalls as $user => $id) {
+            if (!$this->getMultiCall($id)) {
+                unset($this->linkedCalls[$user]);
+            }
+        }
+    }
+
     #[Cron(period: 10)]
     public function statusLoop(): void
     {
@@ -242,6 +468,11 @@ Call _me_ to watch an **awesome** video, or send /call to make _me_ call _you_ (
 
 Send me the link of a video chat or a conference call, and I'll join it too!
 Add me to your group and send /videochat to make me join its video chat (or start one, if I'm allowed to)!
+
+During a call, change what I play (in our private chat, in the group, or in the chat of the call):
+/play - reply to a video or audio file (or send /play <URL>) to add it to the playlist
+/skip - skip the file being played
+/loop - reply to a file (or send /loop <URL>) to loop it instead of my video when the playlist is empty, send just /loop to loop nothing, /loop default to loop my video again
 
 You can also program a phone call with /program:
 
@@ -329,7 +560,7 @@ Propic art by magnaluna on [deviantart](https://magnaluna.deviantart.com).
 
     public function __sleep(): array
     {
-        return ['programmed_call', 'my_users', 'messageIds', 'calls'];
+        return ['programmed_call', 'my_users', 'messageIds', 'calls', 'linkedCalls'];
     }
 }
 
