@@ -682,7 +682,7 @@ namespace Magnaluna {
          *
          * @throws YouTubeException If it can't be played.
          */
-        public static function open(string $videoId, int $maxHeight = 720, ?Cancellation $cancellation = null): self
+        public static function open(string $videoId, int $maxHeight = 1080, ?Cancellation $cancellation = null): self
         {
             [$player, $userAgent, $client] = YouTube::getPlayer($videoId, $cancellation);
             if ($player['videoDetails']['isLive'] ?? false) {

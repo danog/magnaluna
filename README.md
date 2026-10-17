@@ -29,7 +29,7 @@ Don't forget to install the [required dependencies](https://docs.madelineproto.x
 
 ## YouTube videos
 
-YouTube videos are played in up to 720p, entirely in pure PHP (see the `Magnaluna` namespace in `magna.php`): like yt-dlp, their formats are got with the visionOS InnerTube client and a visitor ID, which need no JavaScript player nor PO token; their VP9 video and OPUS audio are fetched a range at a time, and muxed into a WebM file on the fly, without ffmpeg.
+YouTube videos are played in up to 1080p, entirely in pure PHP (see the `Magnaluna` namespace in `magna.php`): like yt-dlp, their formats are got with the visionOS InnerTube client and a visitor ID, which need no JavaScript player nor PO token; their VP9 video and OPUS audio are fetched a range at a time, and muxed into a WebM file on the fly, without ffmpeg.
 The stream is resumable: when magnaluna restarts, the video resumes where it was.
 
 ## Changing the video
