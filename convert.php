@@ -1,9 +1,13 @@
 <?php declare(strict_types=1);
 
-if (!file_exists('madeline.php')) {
-    copy('https://phar.madelineproto.xyz/madeline.php', 'madeline.php');
+if (file_exists('vendor/autoload.php')) {
+    require 'vendor/autoload.php';
+} else {
+    if (!file_exists('madeline.php')) {
+        copy('https://phar.madelineproto.xyz/madeline.php', 'madeline.php');
+    }
+    require 'madeline.php';
 }
-include 'madeline.php';
 
 use danog\MadelineProto\LocalFile;
 

@@ -9,7 +9,7 @@ It plays a video in:
 - video chats and end-to-end encrypted conference calls, whose links you send it;
 - the video chats of the groups it's added to, when you send it `/join` or `/videochat` (it also starts one, if it may).
 
-During a call, `/play` (replying to a video or audio file, or with a URL) adds a file to the playlist, `/skip` skips the file being played, and `/loop` (replying to a file, or with a URL) changes the video looped when the playlist is empty: send just `/loop` to loop nothing, `/loop default` to loop the default video again.
+During a call, `/play` (replying to a video or audio file, or with a URL, even of a YouTube video) adds a file to the playlist, `/skip` skips the file being played, and `/loop` (replying to a file, or with a URL) changes the video looped when the playlist is empty: send just `/loop` to loop nothing, `/loop default` to loop the default video again.
 Send them in the private chat (for one-to-one calls and the calls joined with a link you sent), in the group (for its video chat) or in the chat of the call (URLs only); files are streamed, never downloaded.
 Send `/leave` in the group (for its video chat) or in the chat of the call to make it leave a video chat or conference call.
 
@@ -26,6 +26,11 @@ wget https://github.com/danog/magnaluna/raw/master/magna.php && php magna.php
 ```
 
 Don't forget to install the [required dependencies](https://docs.madelineproto.xyz/docs/REQUIREMENTS.html) for MadelineProto.
+
+## YouTube videos
+
+YouTube videos are played in up to 720p, entirely in pure PHP (see the `Magnaluna` namespace in `magna.php`): like yt-dlp, their formats are got with the visionOS InnerTube client and a visitor ID, which need no JavaScript player nor PO token; their VP9 video and OPUS audio are fetched a range at a time, and muxed into a WebM file on the fly, without ffmpeg.
+The stream is resumable: when magnaluna restarts, the video resumes where it was.
 
 ## Changing the video
 
