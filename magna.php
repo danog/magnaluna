@@ -1739,7 +1739,7 @@ namespace Magnaluna {
                     $jumped = true;
                 }
                 try {
-                    $frames = [];
+                    $byKind = [];
                     foreach ($kinds as $kind) {
                         $waited = 0;
                         $since = microtime(true);
@@ -1753,7 +1753,7 @@ namespace Magnaluna {
                             $waited++;
                         }
                         Logger::log(sprintf("Got the segment %d (head %d) of the %s of the live stream %s: %d bytes in %.2f seconds, %d waiting", $this->sequence, $head, $kind, $this->videoId, \strlen($segment), microtime(true) - $since, $waited), Logger::VERBOSE);
-                        $frames = [...$frames, ...$this->demux($kind, $segment)];
+                        $byKind[$kind] = $this->demux($kind, $segment);
                     }
                 } catch (LiveEdgeException) {
                     $this->sequence = null;
@@ -1762,7 +1762,17 @@ namespace Magnaluna {
                 $this->sequence++;
                 break;
             }
-            usort($frames, static fn (array $a, array $b): int => [$a['timestamp'], $a['kind'] === 'audio'] <=> [$b['timestamp'], $b['kind'] === 'audio']);
+            // Merged by timestamp, keeping the order of each track: video with B-frames is in decoding order, not in
+            // timestamp (presentation) order.
+            $video = $byKind['video'] ?? [];
+            $audio = $byKind['audio'] ?? [];
+            $frames = [];
+            $v = $a = 0;
+            while (isset($video[$v]) || isset($audio[$a])) {
+                $frames[] = isset($video[$v]) && (!isset($audio[$a]) || $video[$v]['timestamp'] <= $audio[$a]['timestamp'])
+                    ? $video[$v++]
+                    : $audio[$a++];
+            }
             if ($frames === []) {
                 return;
             }
