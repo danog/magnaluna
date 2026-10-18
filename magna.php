@@ -1508,12 +1508,6 @@ namespace {
         private array $calls = [];
         /** @var array<int, int> */
         private array $messageIds = [];
-        /**
-         * The video chat or conference call each user last made us join with a link, to control it from their private chat.
-         *
-         * @var array<int, int>
-         */
-        private array $linkedCalls = [];
         public function onStart(): void
         {
             $self = $this->getSelf();
@@ -1648,21 +1642,91 @@ namespace {
             return $call?->isJoined() ? $call : null;
         }
 
+        /** The username, link or ID of a group or channel. */
+        private const CHAT_REFERENCE = '~^(?:@\w+|-?\d+|(?:https?://)?(?:t|telegram)\.me/\S+)$~i';
+
         /**
-         * The call controlled by the commands sent in a chat: our call with a user (or else the call they
-         * last made us join with a link), or the video chat of a group.
+         * What the first argument of a command refers to, if it's a call rather than a file: the link of a video chat
+         * or conference call, or the username, link or ID of a group or channel.
+         *
+         * @return array{peer: ?int, slug: ?string, inviteHash: ?string, link: bool}|null
+         *
+         * @throws InvalidArgumentException If it's not a group or channel we can see.
          */
-        private function getCallFor(Message $message): ?Call
+        private function parseTarget(string $arg): ?array
         {
-            if ($message->chatId > 0) {
-                if ($call = $this->getCallByPeer($message->chatId)) {
-                    return $call;
-                }
-                $id = $this->linkedCalls[$message->chatId] ?? null;
-                return $id === null ? null : $this->getMultiCall($id);
+            if (preg_match(self::CONFERENCE_LINK, $arg, $matches)) {
+                return ['peer' => null, 'slug' => $matches[1], 'inviteHash' => null, 'link' => true];
             }
-            $call = $this->getGroupCall($message->chatId);
-            return $call?->isJoined() ? $call : null;
+            $link = preg_match(self::GROUP_CALL_LINK, $arg, $matches) === 1;
+            if (!$link && !preg_match(self::CHAT_REFERENCE, $arg)) {
+                return null;
+            }
+            try {
+                $peer = $this->getId($link ? '@'.$matches[1] : $arg);
+            } catch (Throwable) {
+                $peer = null;
+            }
+            if ($peer === null || $peer > 0) {
+                throw new InvalidArgumentException("$arg is not a group or channel I can see.");
+            }
+            return ['peer' => $peer, 'slug' => null, 'inviteHash' => $link ? ($matches[2] ?? null) : null, 'link' => $link];
+        }
+
+        /**
+         * The role of a user in a group or channel whose calls they may control: as a member of it, or anyone if it's
+         * public (as they could send the link of its video chat); null if they may not.
+         *
+         * @return self::ROLE_*|null
+         */
+        private function getAccess(int $peer, int $userId): ?string
+        {
+            if (in_array($userId, self::ADMINS, true)) {
+                return self::ROLE_CALLS;
+            }
+            // Only admins can check who is in a channel.
+            return $this->getRole($peer, $userId)
+                ?? (self::isPublic($this->getInfo($peer)['Chat'] ?? []) ? self::ROLE_MEMBER : null);
+        }
+
+        /**
+         * The call a command applies to, along with its other arguments: the call of the group, channel or call link
+         * passed as its first argument, or else the call of the chat it was sent in (our call with a user, or the
+         * video chat of a group).
+         *
+         * @return array{Call, list<string>}|string The call and the other arguments, or why there is none.
+         */
+        private function getCallFor(Message $message): array|string
+        {
+            $args = $message->commandArgs ?? [];
+            try {
+                $target = isset($args[0]) ? $this->parseTarget($args[0]) : null;
+                if ($target === null) {
+                    $call = $message->chatId > 0 ? $this->getCallByPeer($message->chatId) : $this->getGroupCall($message->chatId);
+                    if (!$call?->isJoined()) {
+                        return $this->notInCall($message);
+                    }
+                } else {
+                    $where = array_shift($args);
+                    $call = $target['slug'] !== null
+                        ? $this->getConferenceCallBySlug($target['slug'])
+                        : $this->getGroupCall($target['peer']);
+                    if (!$call?->isJoined()) {
+                        return "I'm not in the call of $where: send /join $where first!";
+                    }
+                    if (!$target['link'] && $this->getAccess($target['peer'], $message->senderId) === null) {
+                        return "Only the members of $where can change what I play there.";
+                    }
+                }
+            } catch (InvalidArgumentException $e) {
+                return $e->getMessage();
+            } catch (Throwable $e) {
+                return "Could not find the call: {$e->getMessage()}";
+            }
+            if (!$this->mayControl($call, $message->senderId)) {
+                return self::NOT_LIVESTREAM_ADMIN;
+            }
+            return [$call, array_values($args)];
         }
 
         /**
@@ -1719,15 +1783,15 @@ namespace {
 
         /**
          * The file a playlist command refers to, along with a note on how it will be played: the URL
-         * passed to it, the file it was sent with or the file it replies to (streamed, not downloaded);
+         * passed to it (if any), the file it was sent with or the file it replies to (streamed, not downloaded);
          * null if none.
          *
          * @return array{RemoteUrl|ReadableStream, string}|null
          */
-        private function getFile(Message $message, bool $rtmp): ?array
+        private function getFile(Message $message, ?string $url, bool $rtmp): ?array
         {
-            if (isset($message->commandArgs[0])) {
-                return self::parseUrl($message->commandArgs[0], $rtmp);
+            if ($url !== null) {
+                return self::parseUrl($url, $rtmp);
             }
             $media = $message->media;
             if ($media === null && $message->replyToMsgId !== null) {
@@ -1766,16 +1830,14 @@ namespace {
         #[FilterCommand('play')]
         public function playCommand(Incoming&Message $message): void
         {
-            if (!$call = $this->getCallFor($message)) {
-                $message->reply($this->notInCall($message));
+            $target = $this->getCallFor($message);
+            if (is_string($target)) {
+                $message->reply($target);
                 return;
             }
-            if (!$this->mayControl($call, $message->senderId)) {
-                $message->reply(self::NOT_LIVESTREAM_ADMIN);
-                return;
-            }
+            [$call, $args] = $target;
             try {
-                $file = $this->getFile($message, self::isRtmp($call));
+                $file = $this->getFile($message, $args[0] ?? null, self::isRtmp($call));
                 $message->reply($file === null
                     ? 'Reply to a video or audio file with /play, or send /play <URL>, to add it to the playlist.'
                     : $this->enqueue($call, ...$file));
@@ -1787,18 +1849,16 @@ namespace {
         #[FilterCommand('loop')]
         public function loopCommand(Incoming&Message $message): void
         {
-            if (!$call = $this->getCallFor($message)) {
-                $message->reply($this->notInCall($message));
+            $target = $this->getCallFor($message);
+            if (is_string($target)) {
+                $message->reply($target);
                 return;
             }
-            if (!$this->mayControl($call, $message->senderId)) {
-                $message->reply(self::NOT_LIVESTREAM_ADMIN);
-                return;
-            }
+            [$call, $args] = $target;
             try {
-                $file = ($message->commandArgs[0] ?? null) === 'default'
+                $file = ($args[0] ?? null) === 'default'
                     ? [self::defaultVideo($call), '']
-                    : $this->getFile($message, self::isRtmp($call));
+                    : $this->getFile($message, $args[0] ?? null, self::isRtmp($call));
                 $message->reply($this->setLoop($call, $file[0] ?? null, $file[1] ?? ''));
             } catch (InvalidArgumentException $e) {
                 $message->reply($e->getMessage());
@@ -1808,15 +1868,8 @@ namespace {
         #[FilterCommand('skip')]
         public function skipCommand(Incoming&Message $message): void
         {
-            if (!$call = $this->getCallFor($message)) {
-                $message->reply($this->notInCall($message));
-                return;
-            }
-            if (!$this->mayControl($call, $message->senderId)) {
-                $message->reply(self::NOT_LIVESTREAM_ADMIN);
-                return;
-            }
-            $message->reply($this->skip($call));
+            $target = $this->getCallFor($message);
+            $message->reply(is_string($target) ? $target : $this->skip($target[0]));
         }
 
         private function skip(Call $call): string
@@ -1828,7 +1881,7 @@ namespace {
         private function notInCall(Message $message): string
         {
             return $message->chatId > 0
-                ? "We're not in a call: call me, send /call, or send me the link of a video chat or conference call first!"
+                ? "We're not in a call: call me or send /call first! To change what I play in a video chat or conference call, add its group, channel or link after the command, e.g. /play @group <URL>."
                 : "I'm not in this group's video chat: send /join first!";
         }
 
@@ -1873,134 +1926,104 @@ namespace {
         }
 
         /**
-         * Join the video chat of a group (starting one if none is running and we may), and play the video.
+         * Join a video chat, livestream or conference call, and play the video: the video chat of the group the command
+         * is sent in (starting one if none is running and we may), or else the call of the group, channel or call link
+         * passed to it, to keep the commands out of their chat.
          */
         #[FiltersOr(new FilterCommand('join'), new FilterCommand('videochat'))]
-        public function joinCommand(Incoming&GroupMessage $message): void
+        public function joinCommand(Incoming&Message $message): void
         {
+            $where = $message->commandArgs[0] ?? null;
             try {
-                $joined = $this->getGroupCall($message->chatId)?->isJoined() ?? false;
-                $call = $message->requestCall()->join();
-                if (!$this->mayControl($call, $message->senderId)) {
-                    if (!$joined) {
-                        $call->leave();
-                    }
-                    $message->reply(self::NOT_LIVESTREAM_ADMIN);
-                    return;
-                }
-                $this->broadcast($call);
-                $message->reply('Playing in the video chat!');
-            } catch (CallNotAllowedException $e) {
-                $message->reply("I can't start a video chat here: {$e->reason->value}");
-            } catch (Throwable $e) {
-                $message->reply("Could not join the video chat: {$e->getMessage()}");
+                $target = $where === null ? null : $this->parseTarget($where);
+            } catch (InvalidArgumentException $e) {
+                $message->reply($e->getMessage());
+                return;
             }
+            if ($target === null && ($where !== null || !$message instanceof GroupMessage)) {
+                $message->reply('Send /join <username or link of a group or channel, or link of a call> to make me join its video chat, livestream or conference call (or just /join in a group).');
+                return;
+            }
+            $message->reply($this->joinCall($message, $target, $where));
         }
 
         /**
-         * Leave the video chat of a group.
-         */
-        #[FilterCommand('leave')]
-        public function leaveCommand(Incoming&GroupMessage $message): void
-        {
-            $call = $this->getGroupCall($message->chatId);
-            if (!$call?->isJoined()) {
-                $message->reply($this->notInCall($message));
-                return;
-            }
-            if (!$this->mayControl($call, $message->senderId)) {
-                $message->reply(self::NOT_LIVESTREAM_ADMIN);
-                return;
-            }
-            try {
-                $call->leave();
-                $message->reply('Left the video chat! Send /join to make me join it again.');
-            } catch (Throwable $e) {
-                $message->reply("Could not leave the video chat: {$e->getMessage()}");
-            }
-        }
-
-        /**
-         * Join the video chat or livestream of a group or channel from our private chat, to keep the commands out
-         * of it (starting one if none is running, and both we and the user may), and play the video.
+         * Join the call of a group, channel or call link (see parseTarget()), or else of the group the message was
+         * sent in, and play the video.
          *
-         * The commands sent in our private chat then control it.
+         * @param ?array{peer: ?int, slug: ?string, inviteHash: ?string, link: bool} $target
+         *
+         * @return string The reply.
          */
-        #[FiltersOr(new FilterCommand('join'), new FilterCommand('videochat'))]
-        public function joinPrivateCommand(Incoming&PrivateMessage $message): void
+        private function joinCall(Message $message, ?array $target, ?string $where): string
         {
-            $arg = $message->commandArgs[0] ?? null;
-            if ($arg === null) {
-                $message->reply('Send /join <username or link of a group or channel> to make me join its video chat or livestream, then send me /play, /loop, /skip and /leave here to control it.');
-                return;
-            }
             try {
-                $peer = $this->getId($arg);
-            } catch (Throwable) {
-                $peer = null;
-            }
-            if ($peer === null || $peer > 0) {
-                $message->reply("$arg is not a group or channel I'm in.");
-                return;
-            }
-            // Only those who could send /join in the group, or watch the video chat of the channel: anyone, if it's
-            // public, as they could send its link (and only admins can check who is in a channel).
-            $role = in_array($message->senderId, self::ADMINS, true)
-                ? self::ROLE_CALLS
-                : $this->getRole($peer, $message->senderId);
-            if ($role === null && self::isPublic($this->getInfo($peer)['Chat'] ?? [])) {
-                $role = self::ROLE_MEMBER;
-            }
-            if ($role === null) {
-                $message->reply("Only the members of $arg can make me join its video chat.");
-                return;
-            }
-            try {
-                $call = $this->getGroupCall($peer);
-                $joined = $call?->isJoined() ?? false;
-                if ($call === null) {
-                    if ($role !== self::ROLE_CALLS) {
-                        $message->reply("There's no video chat in $arg: only its admins who can manage video chats can make me start one.");
-                        return;
+                if ($target === null) {
+                    \assert($message instanceof GroupMessage);
+                    $call = $message->requestCall();
+                } elseif ($target['slug'] !== null) {
+                    $call = $this->getConferenceCallBySlug($target['slug'])
+                        ?? throw new InvalidArgumentException('This conference link is not valid any more!');
+                } else {
+                    $call = $this->getGroupCall($target['peer']);
+                    // Anyone may use the link of a video chat, as in the app.
+                    if (!$target['link']) {
+                        $role = $this->getAccess($target['peer'], $message->senderId);
+                        if ($role === null) {
+                            return "Only the members of $where can make me join its video chat.";
+                        }
+                        if ($call === null && $role !== self::ROLE_CALLS) {
+                            return "There's no video chat in $where: only its admins who can manage video chats can make me start one.";
+                        }
+                        $call ??= $this->createGroupCall($target['peer']);
                     }
-                    $call = $this->createGroupCall($peer);
+                    $call ?? throw new InvalidArgumentException("There's no video chat in $where!");
                 }
-                $call->join();
+                $joined = $call->isJoined();
+                if ($target['inviteHash'] ?? null) {
+                    $call = $this->joinGroupCall($target['peer'], inviteHash: $target['inviteHash']);
+                } else {
+                    $call->join();
+                }
                 if (!$this->mayControl($call, $message->senderId)) {
                     if (!$joined) {
                         $call->leave();
                     }
-                    $message->reply(self::NOT_LIVESTREAM_ADMIN);
-                    return;
+                    return self::NOT_LIVESTREAM_ADMIN;
                 }
                 $this->broadcast($call);
-                $this->linkedCalls[$message->chatId] = $call->id;
-                $message->reply('Playing in the video chat! Send me /play, /loop, /skip and /leave here to control it.');
+                return $target === null
+                    ? 'Playing in the video chat!'
+                    : "Joined! Send /play $where, /loop $where, /skip $where or /leave $where (here, or anywhere else) to control what I play there.";
+            } catch (CallNotAllowedException $e) {
+                return "I can't start a video chat here: {$e->reason->value}";
+            } catch (InvalidArgumentException $e) {
+                return $e->getMessage();
             } catch (Throwable $e) {
-                $message->reply("Could not join the video chat: {$e->getMessage()}");
+                return "Could not join the call: {$e->getMessage()}";
             }
         }
 
         /**
-         * Leave the video chat or conference call controlled from our private chat.
+         * Leave a video chat or conference call: the one of the group, channel or call link passed to the command,
+         * or else the video chat of the group it's sent in.
          */
         #[FilterCommand('leave')]
-        public function leavePrivateCommand(Incoming&PrivateMessage $message): void
+        public function leaveCommand(Incoming&Message $message): void
         {
-            $id = $this->linkedCalls[$message->chatId] ?? null;
-            $call = $id === null ? null : $this->getMultiCall($id);
-            if ($call === null) {
-                unset($this->linkedCalls[$message->chatId]);
-                $message->reply("I'm not in a video chat or conference call controlled from here: send /join <group or channel>, or the link of a call, first!");
+            if ($message->chatId > 0 && !isset($message->commandArgs[0])) {
+                $message->reply('Send /leave <username or link of a group or channel, or link of a call> to make me leave its call.');
                 return;
             }
-            if (!$this->mayControl($call, $message->senderId)) {
-                $message->reply(self::NOT_LIVESTREAM_ADMIN);
+            $target = $this->getCallFor($message);
+            if (is_string($target)) {
+                $message->reply($target);
                 return;
             }
+            $call = $target[0];
+            \assert($call instanceof MultiCall);
             try {
                 $call->leave();
-                unset($this->linkedCalls[$message->chatId]);
                 $message->reply('Left the call!');
             } catch (Throwable $e) {
                 $message->reply("Could not leave the call: {$e->getMessage()}");
@@ -2013,31 +2036,20 @@ namespace {
         #[Handler]
         public function callLink(Incoming&PrivateMessage $message): void
         {
-            try {
-                if (preg_match(self::CONFERENCE_LINK, $message->message, $matches)) {
-                    $message->reply('Joining the conference call...');
-                    $call = $this->joinConferenceCallBySlug($matches[1]);
-                } elseif (preg_match(self::GROUP_CALL_LINK, $message->message, $matches)) {
-                    $message->reply('Joining the video chat...');
-                    $joined = $this->getGroupCall('@'.$matches[1])?->isJoined() ?? false;
-                    $call = $this->joinGroupCall('@'.$matches[1], inviteHash: $matches[2] ?? null);
-                } else {
-                    return;
-                }
-                if (!$this->mayControl($call, $message->senderId)) {
-                    // Leave it, unless we were already in it (conference calls are never livestreams, they don't get here).
-                    if (!($joined ?? true)) {
-                        $call->leave();
-                    }
-                    $message->reply(self::NOT_LIVESTREAM_ADMIN);
-                    return;
-                }
-                $this->broadcast($call);
-                $this->linkedCalls[$message->chatId] = $call->id;
-                $message->reply('Joined! Send me /play, /loop and /skip here, or in the chat of the call, to change what I play there.');
-            } catch (Throwable $e) {
-                $message->reply("Could not join the call: {$e->getMessage()}");
+            // Commands refer to calls with links too.
+            if ($message->command !== null
+                || !(preg_match(self::CONFERENCE_LINK, $message->message, $matches) || preg_match(self::GROUP_CALL_LINK, $message->message, $matches))
+            ) {
+                return;
             }
+            $message->reply('Joining the call...');
+            try {
+                $target = $this->parseTarget($matches[0]);
+            } catch (InvalidArgumentException $e) {
+                $message->reply($e->getMessage());
+                return;
+            }
+            $message->reply($this->joinCall($message, $target, $matches[0]));
         }
 
         private int $lastLog = 0;
@@ -2099,19 +2111,6 @@ namespace {
         {
             return self::ADMINS;
         }
-        /**
-         * Forget the calls we left.
-         */
-        #[Cron(period: 3600)]
-        public function cleanup(): void
-        {
-            foreach ($this->linkedCalls as $user => $id) {
-                if (!$this->getMultiCall($id)) {
-                    unset($this->linkedCalls[$user]);
-                }
-            }
-        }
-
         #[Cron(period: 10)]
         public function statusLoop(): void
         {
@@ -2158,7 +2157,9 @@ namespace {
             try {
                 $runCall = $message->message === '/call';
                 // Call links are joined by callLink(), instead.
-                $isCallLink = preg_match(self::CONFERENCE_LINK, $message->message) || preg_match(self::GROUP_CALL_LINK, $message->message);
+                // So are the commands for other calls.
+                $isCallLink = preg_match(self::CONFERENCE_LINK, $message->message) || preg_match(self::GROUP_CALL_LINK, $message->message)
+                    || in_array($message->command, ['join', 'videochat', 'leave', 'play', 'loop', 'skip'], true);
                 if (!isset($this->my_users[$message->chatId]) || $message->message === '/start') {
                     $runCall = true;
                     $this->my_users[$message->chatId] = true;
@@ -2167,7 +2168,7 @@ namespace {
 
 Call _me_ to watch an **awesome** video, or send /call to make _me_ call _you_ (don't forget to disable call privacy settings!).
 
-Send me the link of a video chat, livestream or conference call, and I'll join it too (I can play in livestreams only if I'm an admin of their group or channel)!
+Send me the link of a video chat, livestream or conference call, and I'll join it too!
 Add me to your group and send /join to make me join its video chat.
 
 Commands:
@@ -2177,13 +2178,20 @@ Commands:
   /program 29 August 2018 - call me the 29th of august 2018
   /program +1 hour 30 minutes - call me in one hour and thirty minutes
   /program next Thursday - call me next Thursday at midnight
-/join (or /videochat) - in a group, join its video chat (or start one, if I'm allowed to); here, send /join <username or link of a group or channel> to do the same without sending commands there
-/leave - leave the video chat or conference call (in the group, in the chat of the call, or here if you made me join it from here)
-
-During a call, change what I play (in our private chat, in the group, or in the chat of the call), only as an admin in livestreams:
+/join (or /videochat) - join the video chat of the group (or start one, if I'm allowed to)
+/leave - leave the video chat of the group
 /play - reply to a video or audio file (or send /play <URL>, even of a YouTube video) to add it to the playlist
 /skip - skip the file being played
 /loop - reply to a file (or send /loop <URL>, even of a YouTube video) to loop it instead of my video when the playlist is empty, send just /loop to loop nothing, /loop default to loop my video again
+
+The commands apply to our call, or to the video chat of the group they're sent in.
+To use them for another video chat, livestream or conference call without sending them in its chat (even from here), put its group or channel (username, link or ID) or its link right after the command, for example:
+  /join @mygroup
+  /play @mygroup https://youtu.be/dQw4w9WgXcQ
+  /loop https://t.me/call/... default
+  /leave @mygroup
+In the chat of a call, the commands apply to that call (/play and /loop only take URLs there).
+In livestreams, only the admins of the group or channel can choose what I play, and I can play only if I'm an admin too.
 
 Admin only:
 /restart - restart me
@@ -2266,7 +2274,7 @@ Source code: https://github.com/danog/MadelineProto
 
         public function __sleep(): array
         {
-            return ['programmed_call', 'my_users', 'messageIds', 'calls', 'linkedCalls'];
+            return ['programmed_call', 'my_users', 'messageIds', 'calls'];
         }
     }
 
