@@ -1508,6 +1508,12 @@ namespace {
         private array $calls = [];
         /** @var array<int, int> */
         private array $messageIds = [];
+        /**
+         * The groups and channels whose video chats only their admins may control, see adminOnlyCommand().
+         *
+         * @var array<int, true>
+         */
+        private array $adminOnly = [];
         public function onStart(): void
         {
             $self = $this->getSelf();
@@ -1560,25 +1566,34 @@ namespace {
         }
 
         /**
-         * Whether a user may change what we play in a call.
+         * Why a user may not change what we play in a call, or null if they may.
          *
          * What we play in an RTMP livestream replaces its broadcast, so only the admins of its group or channel
-         * (or the owner of its live story) may choose it, as they could themselves.
+         * (or the owner of its live story) may choose it, as they could themselves. The admins of a group or channel
+         * can also keep its video chats to themselves, see adminOnlyCommand().
          */
-        private function mayControl(Call $call, int $userId): bool
+        private function controlDenial(Call $call, int $userId): ?string
         {
-            if (!self::isRtmp($call) || in_array($userId, self::ADMINS, true)) {
-                return true;
-            }
+            $rtmp = self::isRtmp($call);
             $peer = $call->peerId ?? null;
+            if (in_array($userId, self::ADMINS, true) || (!$rtmp && !isset($this->adminOnly[$peer ?? 0]))) {
+                return null;
+            }
             if ($peer === null) {
-                return false;
+                $allowed = false;
+            } elseif ($peer > 0) {
+                $allowed = $peer === $userId;
+            } else {
+                $role = $this->getRole($peer, $userId);
+                // Getting the RTMP key of a livestream takes the right to manage its calls.
+                $allowed = $rtmp ? $role === self::ROLE_CALLS : ($role === self::ROLE_ADMIN || $role === self::ROLE_CALLS);
             }
-            if ($peer > 0) {
-                return $peer === $userId;
+            if ($allowed) {
+                return null;
             }
-            // Getting the RTMP key of a livestream takes the right to manage its calls.
-            return $this->getRole($peer, $userId) === self::ROLE_CALLS;
+            return $rtmp
+                ? "Only the admins of this livestream's group or channel can choose what I play in it."
+                : 'Only the admins of this group or channel can choose what I play in its video chat (one of them sent /adminonly on).';
         }
 
         /**
@@ -1599,6 +1614,8 @@ namespace {
 
         /** A member of a group or channel. */
         private const ROLE_MEMBER = 'member';
+        /** An admin of a group or channel who may not manage its calls. */
+        private const ROLE_ADMIN = 'admin';
         /** A member of a group or channel who may manage its calls: its creator, or an admin with that right. */
         private const ROLE_CALLS = 'calls';
 
@@ -1609,12 +1626,16 @@ namespace {
          */
         private function getRole(int $peer, int $userId): ?string
         {
+            // Anonymous admins send messages as the group.
+            if ($userId === $peer) {
+                return self::ROLE_ADMIN;
+            }
             try {
                 if (DialogId::isSupergroupOrChannel($peer)) {
                     $participant = $this->channels->getParticipant(channel: $peer, participant: $userId)['participant'];
                     return match ($participant['_']) {
                         'channelParticipantCreator' => self::ROLE_CALLS,
-                        'channelParticipantAdmin' => ($participant['admin_rights']['manage_call'] ?? false) ? self::ROLE_CALLS : self::ROLE_MEMBER,
+                        'channelParticipantAdmin' => ($participant['admin_rights']['manage_call'] ?? false) ? self::ROLE_CALLS : self::ROLE_ADMIN,
                         'channelParticipantLeft' => null,
                         'channelParticipantBanned' => ($participant['left'] ?? false) ? null : self::ROLE_MEMBER,
                         default => self::ROLE_MEMBER,
@@ -1631,7 +1652,6 @@ namespace {
             return null;
         }
 
-        private const NOT_LIVESTREAM_ADMIN = "Only the admins of this livestream's group or channel can choose what I play in it.";
 
         /**
          * Get a video chat or conference call we're in, by its ID.
@@ -1730,8 +1750,9 @@ namespace {
             } catch (Throwable $e) {
                 return "Could not find the call: {$e->getMessage()}";
             }
-            if (!$this->mayControl($call, $message->senderId)) {
-                return self::NOT_LIVESTREAM_ADMIN;
+            $denial = $this->controlDenial($call, $message->senderId);
+            if ($denial !== null) {
+                return $denial;
             }
             return [$call, array_values($args)];
         }
@@ -1904,8 +1925,9 @@ namespace {
             ) {
                 return;
             }
-            if (!$this->mayControl($call, $message->fromId)) {
-                $call->sendMessage(self::NOT_LIVESTREAM_ADMIN);
+            $denial = $this->controlDenial($call, $message->fromId);
+            if ($denial !== null) {
+                $call->sendMessage($denial);
                 return;
             }
             if ($matches[1] === 'leave') {
@@ -2008,11 +2030,12 @@ namespace {
                 } else {
                     $call->join();
                 }
-                if (!$this->mayControl($call, $message->senderId)) {
+                $denial = $this->controlDenial($call, $message->senderId);
+                if ($denial !== null) {
                     if (!$joined) {
                         $call->leave();
                     }
-                    return self::NOT_LIVESTREAM_ADMIN;
+                    return $denial;
                 }
                 $this->broadcast($call);
                 return $call;
@@ -2022,6 +2045,47 @@ namespace {
                 return $e->getMessage();
             } catch (Throwable $e) {
                 return "Could not join the call: {$e->getMessage()}";
+            }
+        }
+
+        /**
+         * Let only the admins of a group or channel change what we play in its video chats, or everyone again (livestreams
+         * are always only for admins): /adminonly [group or channel] on|off, as one of its admins.
+         */
+        #[FilterCommand('adminonly')]
+        public function adminOnlyCommand(Incoming&Message $message): void
+        {
+            $args = $message->commandArgs ?? [];
+            try {
+                $target = isset($args[0]) ? $this->parseTarget($args[0]) : null;
+            } catch (InvalidArgumentException $e) {
+                $message->reply($e->getMessage());
+                return;
+            }
+            $where = $target === null ? 'this group' : array_shift($args);
+            $peer = $target === null ? ($message->chatId < 0 ? $message->chatId : null) : $target['peer'];
+            $mode = $args[0] ?? null;
+            if ($peer === null || !in_array($mode, [null, 'on', 'off'], true)) {
+                $message->reply('Send /adminonly on (or off) in a group, or /adminonly <username, link or ID of a group or channel> on (or off) anywhere, to let only its admins (or everyone again) change what I play in its video chat.');
+                return;
+            }
+            if ($mode === null) {
+                $message->reply(isset($this->adminOnly[$peer])
+                    ? "Only the admins of $where can change what I play in its video chat: an admin can send /adminonly off to let everyone do it."
+                    : "Everyone can change what I play in the video chat of $where: an admin can send /adminonly on to keep it to the admins.");
+                return;
+            }
+            $role = in_array($message->senderId, self::ADMINS, true) ? self::ROLE_CALLS : $this->getRole($peer, $message->senderId);
+            if ($role !== self::ROLE_ADMIN && $role !== self::ROLE_CALLS) {
+                $message->reply("Only the admins of $where can change who controls what I play there.");
+                return;
+            }
+            if ($mode === 'on') {
+                $this->adminOnly[$peer] = true;
+                $message->reply("Only the admins of $where can change what I play in its video chat now.");
+            } else {
+                unset($this->adminOnly[$peer]);
+                $message->reply("Everyone can change what I play in the video chat of $where now.");
             }
         }
 
@@ -2180,7 +2244,7 @@ namespace {
                 // Call links are joined by callLink(), instead.
                 // So are the commands for other calls.
                 $isCallLink = preg_match(self::CONFERENCE_LINK, $message->message) || preg_match(self::GROUP_CALL_LINK, $message->message)
-                    || in_array($message->command, ['join', 'videochat', 'leave', 'play', 'loop', 'skip'], true);
+                    || in_array($message->command, ['join', 'videochat', 'leave', 'play', 'loop', 'skip', 'adminonly'], true);
                 if (!isset($this->my_users[$message->chatId]) || $message->message === '/start') {
                     $runCall = true;
                     $this->my_users[$message->chatId] = true;
@@ -2204,6 +2268,7 @@ Commands:
 /play - reply to a video or audio file (or send /play <URL>, even of a YouTube video) to add it to the playlist
 /skip - skip the file being played
 /loop - reply to a file (or send /loop <URL>, even of a YouTube video) to loop it instead of my video when the playlist is empty, send just /loop to loop nothing, /loop default to loop my video again
+/adminonly on - as an admin, let only the admins of the group change what I play in its video chat (/adminonly off to let everyone do it again)
 
 The commands apply to our call, or to the video chat of the group they're sent in.
 To use them for another video chat, livestream or conference call without sending them in its chat (even from here), put its group or channel (username, link or ID) or its link right after the command, for example:
@@ -2211,6 +2276,7 @@ To use them for another video chat, livestream or conference call without sendin
   /play @mygroup https://youtu.be/dQw4w9WgXcQ (/play and /loop join the call first, if needed)
   /loop https://t.me/call/... default
   /leave @mygroup
+  /adminonly @mygroup on
 In the chat of a call, the commands apply to that call (/play and /loop only take URLs there).
 In livestreams, only the admins of the group or channel can choose what I play, and I can play only if I'm an admin too.
 
@@ -2295,7 +2361,7 @@ Source code: https://github.com/danog/MadelineProto
 
         public function __sleep(): array
         {
-            return ['programmed_call', 'my_users', 'messageIds', 'calls'];
+            return ['programmed_call', 'my_users', 'messageIds', 'calls', 'adminOnly'];
         }
     }
 
