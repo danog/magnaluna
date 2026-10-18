@@ -1586,7 +1586,9 @@ namespace {
             try {
                 if (DialogId::isSupergroupOrChannel($peer)) {
                     $participant = $this->channels->getParticipant(channel: $peer, participant: $userId)['participant'];
-                    return in_array($participant['_'], ['channelParticipantCreator', 'channelParticipantAdmin'], true);
+                    // Getting the RTMP key of a livestream takes the right to manage its calls.
+                    return $participant['_'] === 'channelParticipantCreator'
+                        || ($participant['_'] === 'channelParticipantAdmin' && ($participant['admin_rights']['manage_call'] ?? false));
                 }
                 foreach ($this->messages->getFullChat(chat_id: $peer)['full_chat']['participants']['participants'] ?? [] as $participant) {
                     if ($participant['user_id'] === $userId) {
@@ -1889,13 +1891,14 @@ namespace {
                     $call = $this->joinConferenceCallBySlug($matches[1]);
                 } elseif (preg_match(self::GROUP_CALL_LINK, $message->message, $matches)) {
                     $message->reply('Joining the video chat...');
+                    $joined = $this->getGroupCall('@'.$matches[1])?->isJoined() ?? false;
                     $call = $this->joinGroupCall('@'.$matches[1], inviteHash: $matches[2] ?? null);
                 } else {
                     return;
                 }
                 if (!$this->mayControl($call, $message->senderId)) {
-                    // Stay if someone who may control it linked it too.
-                    if (!in_array($call->id, $this->linkedCalls, true)) {
+                    // Leave it, unless we were already in it (conference calls are never livestreams, they don't get here).
+                    if (!($joined ?? true)) {
                         $call->leave();
                     }
                     $message->reply(self::NOT_LIVESTREAM_ADMIN);
