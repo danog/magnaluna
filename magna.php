@@ -25,19 +25,16 @@ namespace Magnaluna {
     use Amp\Http\Client\HttpClientBuilder;
     use Amp\Http\Client\Request;
     use Closure;
-    use Amp\Process\Process;
+    use Amp\ByteStream\ReadableBuffer;
     use danog\MadelineProto\Logger;
     use danog\MadelineProto\Matroska;
     use danog\MadelineProto\Mp4;
     use danog\MadelineProto\ResumableStream;
-    use danog\MadelineProto\Tools;
     use Generator;
     use IteratorAggregate;
     use RuntimeException;
     use Throwable;
 
-    use function Amp\async;
-    use function Amp\ByteStream\buffer;
     use function Amp\delay;
 
     if (file_exists('vendor/autoload.php')) {
@@ -811,7 +808,7 @@ namespace Magnaluna {
          * @param string $videoId   The ID of the video, see {@see YouTube::parseLink()}.
          * @param int    $maxHeight The highest resolution to play.
          *
-         * @return self|YouTubeLiveStream A live stream is played as a YouTubeLiveStream, with OPUS audio.
+         * @return self|YouTubeLiveStream A live stream is played as a YouTubeLiveStream, just its video.
          *
          * @throws YouTubeException If it can't be played.
          */
@@ -819,7 +816,7 @@ namespace Magnaluna {
         {
             [$player, $userAgent, $client] = YouTube::getPlayer($videoId, $cancellation);
             if ($player['videoDetails']['isLive'] ?? false) {
-                return YouTubeLiveStream::fromPlayer($videoId, $player, aac: false, maxHeight: $maxHeight);
+                return YouTubeLiveStream::fromPlayer($videoId, $player, $userAgent, $client, audio: false, maxHeight: $maxHeight);
             }
             $video = YouTube::pickVideo($player, $maxHeight);
             $audio = YouTube::pickAudio($player)
@@ -1222,7 +1219,7 @@ namespace Magnaluna {
         {
             [$player, $userAgent, $client] = YouTube::getPlayer($videoId, $cancellation);
             if ($player['videoDetails']['isLive'] ?? false) {
-                return YouTubeLiveStream::fromPlayer($videoId, $player, aac: true, maxHeight: $maxHeight);
+                return YouTubeLiveStream::fromPlayer($videoId, $player, $userAgent, $client, audio: true, maxHeight: $maxHeight);
             }
             $video = YouTube::pickH264Video($player, $maxHeight);
             $audio = YouTube::pickAacAudio($player)
@@ -1460,12 +1457,12 @@ namespace Magnaluna {
     }
 
     /**
-     * A YouTube live stream, as a Matroska file with H.264 video and OPUS audio (AAC for RTMP livestreams), that can
-     * be played in calls.
+     * A YouTube live stream, as a Matroska file with H.264 video and AAC audio, that can be played in calls (just its
+     * video: calls only carry OPUS audio) and in RTMP livestreams.
      *
-     * YouTube serves live streams with H.264 and AAC only, as HLS (the audio as a separate rendition): ffmpeg reads
-     * them, copying the video and encoding the audio again, and its output is muxed again, so that ffmpeg can be restarted transparently when the
-     * URLs of the stream expire (after a few hours), or ffmpeg fails.
+     * YouTube serves the video and the audio of a live stream as separate formats, a self-contained fragmented MP4
+     * segment at a time (of about 5 seconds, numbered, with the same clock): the segments are fetched as they're
+     * published, and muxed into a single file on the fly, without ffmpeg.
      *
      * The stream is resumable: once unserialized, it continues from the live edge.
      *
@@ -1501,44 +1498,63 @@ namespace Magnaluna {
         private const ID_TIMESTAMP = 0xE7;
         private const ID_SIMPLE_BLOCK = 0xA3;
 
-        /** Our track numbers, by Matroska track type. */
-        private const TRACKS = [Matroska::TRACK_TYPE_VIDEO => 1, Matroska::TRACK_TYPE_AUDIO => 2];
+        /** Our track numbers and types, and the codecs of the formats. */
+        private const TRACKS = [
+            'video' => ['number' => 1, 'type' => Matroska::TRACK_TYPE_VIDEO, 'codec' => 'V_MPEG4/ISO/AVC'],
+            'audio' => ['number' => 2, 'type' => Matroska::TRACK_TYPE_AUDIO, 'codec' => 'A_AAC'],
+        ];
         /** The longest cluster, in milliseconds: a new one is also started at every video keyframe. */
         private const MAX_CLUSTER_LENGTH = 10_000;
-        /** How many times in a row to try restarting ffmpeg, before giving up. */
+        /** How many segments behind the live edge to start from, so that the next ones are ready in time. */
+        private const START_BEHIND = 2;
+        /** How many times to try fetching a segment (on errors, not while waiting for it to be published). */
         private const ATTEMPTS = 5;
-        /** The gap left between the last frame before a restart of ffmpeg and the first one after it, in milliseconds. */
-        private const RESTART_GAP = 40;
+        /** How long to wait for a segment to be published, in seconds, before checking whether the live stream ended. */
+        private const PUBLISH_TIMEOUT = 30;
+        /** The gap left between the frames before and after a jump to the live edge, in milliseconds. */
+        private const JUMP_GAP = 40;
 
-        private ?Process $process = null;
-        /** @var ?\Iterator<array{track: int, codec: string, type: int, data: string, timestamp: int, keyframe: bool}> */
-        private ?\Iterator $frames = null;
         /**
-         * The tracks of the stream: their codec and its private data, by Matroska track type (fixed by the header).
+         * The URLs of the formats (which expire), and the user agent to fetch them with.
          *
-         * @var array<int, array{codec: string, private: ?string}>
+         * @var array{video?: string, audio?: string, userAgent: string}|null
          */
-        private array $tracks = [];
-        /** @var array<int, int> The numbers of the tracks in the output of the current ffmpeg process, by type. */
-        private array $numbers = [];
-        /** What to add to the timestamps of the current ffmpeg process, to continue after the previous one. */
+        private ?array $urls = null;
+        /** The InnerTube client to get the URLs with, see {@see YouTube::getPlayer()}. */
+        private int $client = 0;
+        /** The next segment to read, or null to start from the live edge. */
+        private ?int $sequence = null;
+        /**
+         * The codec private data of the formats (fixed by the header).
+         *
+         * @var array{video?: ?string, audio?: ?string}
+         */
+        private array $privates = [];
+        /** What to add to the timestamps of the segments, to continue after the frames read before a jump. */
         private int $offset = 0;
         /** The timestamp of the last frame read, in milliseconds. */
         private int $readUntil = -1;
-        /** Whether to wait for a video keyframe, after a restart. */
-        private bool $waitKeyframe = true;
+        /**
+         * The frames of the current segment not read yet, in timestamp order.
+         *
+         * @var list<array{kind: 'video'|'audio', data: string, timestamp: int, keyframe: bool}>
+         */
+        private array $queue = [];
         private ?Cancellation $cancellation = null;
         private bool $headerRead = false;
         private bool $eof = false;
         private bool $closed = false;
         private DeferredFuture $onClose;
 
+        /**
+         * @param ?int $video The itag of the video format, if any.
+         * @param ?int $audio The itag of the audio format, if any.
+         */
         private function __construct(
             public readonly string $videoId,
             public readonly string $title,
-            /** Whether the audio is AAC, for RTMP livestreams, instead of OPUS. */
-            private readonly bool $aac,
-            private readonly int $maxHeight,
+            private readonly ?int $video,
+            private readonly ?int $audio,
         ) {
             $this->onClose = new DeferredFuture;
         }
@@ -1546,195 +1562,241 @@ namespace Magnaluna {
         /**
          * Open a YouTube live stream, from the player response of its video.
          *
-         * @param bool $aac       Whether to play the audio as AAC (for RTMP livestreams), instead of OPUS.
+         * @param bool $audio     Whether to play its audio too (AAC, which only RTMP livestreams carry).
          * @param int  $maxHeight The highest resolution to play.
          *
          * @throws YouTubeException If it can't be played.
          */
-        public static function fromPlayer(string $videoId, array $player, bool $aac, int $maxHeight): self
+        public static function fromPlayer(string $videoId, array $player, string $userAgent, int $client, bool $audio, int $maxHeight): self
         {
-            if (!Tools::canUseFFmpeg()) {
-                throw new YouTubeException('ffmpeg is needed to play live streams');
+            $video = self::pickFormat($player, 'video', $maxHeight);
+            $audioFormat = $audio ? self::pickFormat($player, 'audio', $maxHeight) : null;
+            if ($video === null && $audioFormat === null) {
+                throw new YouTubeException($audio
+                    ? 'This live stream has no H.264 video or AAC audio'
+                    : 'This live stream has no H.264 video, and its audio (AAC) can only be played in RTMP livestreams');
             }
-            $stream = new self($videoId, $player['videoDetails']['title'] ?? $videoId, $aac, $maxHeight);
-            // Fail right away if it can't be played.
-            $stream->start($player);
+            $stream = new self($videoId, $player['videoDetails']['title'] ?? $videoId, $video['itag'] ?? null, $audioFormat['itag'] ?? null);
+            $stream->client = $client;
+            $stream->urls = ['userAgent' => $userAgent];
+            foreach (['video' => $video, 'audio' => $audioFormat] as $kind => $format) {
+                if ($format !== null) {
+                    $stream->urls[$kind] = $format['url'];
+                }
+            }
+            // Fail right away if it can't be played, and get the codec private data for the header.
+            $stream->readSegment();
             return $stream;
         }
 
         /**
-         * The URLs of the HLS playlists of the best variant no higher than the maximum height, from a player response:
-         * its video, and its audio (a separate rendition).
+         * The best H.264 video format no higher than the given height, or the best AAC audio format, of a live stream.
          *
-         * @return array{string, string}
+         * @param 'video'|'audio' $kind
+         *
+         * @return ?array{itag: int, url: string}
          */
-        private function getPlaylists(array $player): array
+        private static function pickFormat(array $player, string $kind, int $maxHeight): ?array
         {
-            $master = $player['streamingData']['hlsManifestUrl'] ?? throw new YouTubeException('This live stream has no HLS playlist');
-            $request = new Request($master);
-            $request->setTransferTimeout(30);
-            $m3u8 = YouTube::getClient()->request($request, $this->cancellation)->getBody()->buffer($this->cancellation);
-            preg_match_all('~#EXT-X-STREAM-INF:([^\n]*)\n([^#\s][^\n]*)~', $m3u8, $matches, PREG_SET_ORDER);
-            $variants = [];
-            foreach ($matches as [, $attributes, $url]) {
-                $height = preg_match('~RESOLUTION=\d+x(\d+)~', $attributes, $m) ? (int) $m[1] : 0;
-                $bandwidth = preg_match('~BANDWIDTH=(\d+)~', $attributes, $m) ? (int) $m[1] : 0;
-                if (!str_contains($attributes, 'avc1')) {
-                    continue;
-                }
-                $audio = preg_match('~AUDIO="([^"]+)"~', $attributes, $m) ? $m[1] : null;
-                $variants[] = ['height' => $height, 'bandwidth' => $bandwidth, 'url' => trim($url), 'audio' => $audio];
-            }
-            if ($variants === []) {
-                throw new YouTubeException('This live stream has no H.264 variant');
-            }
-            // The best variant that fits, or else the smallest one.
-            usort($variants, fn (array $a, array $b): int => [$a['height'] <= $this->maxHeight, $a['height'], $a['bandwidth']]
-                <=> [$b['height'] <= $this->maxHeight, $b['height'], $b['bandwidth']]);
-            $best = end($variants);
-            if ($best['height'] > $this->maxHeight) {
-                $best = $variants[0];
-            }
-            // The audio rendition of the variant, the default one first.
-            preg_match_all('~#EXT-X-MEDIA:([^\n]*)~', $m3u8, $matches);
-            $renditions = [];
-            foreach ($matches[1] as $attributes) {
-                if (str_contains($attributes, 'TYPE=AUDIO')
-                    && str_contains($attributes, 'GROUP-ID="'.$best['audio'].'"')
-                    && preg_match('~URI="([^"]+)"~', $attributes, $m)
-                ) {
-                    $renditions[str_contains($attributes, 'DEFAULT=YES') ? 0 : \count($renditions) + 1] = $m[1];
-                }
-            }
-            ksort($renditions);
-            $audio = reset($renditions);
-            if ($audio === false) {
-                throw new YouTubeException('This live stream has no audio');
-            }
-            return [$best['url'], $audio];
+            $formats = array_filter(
+                $player['streamingData']['adaptiveFormats'] ?? [],
+                static fn (array $format): bool => isset($format['url'], $format['itag'], $format['mimeType'])
+                    && ($kind === 'video'
+                        ? str_starts_with($format['mimeType'], 'video/mp4; codecs="avc1.') && ($format['height'] ?? PHP_INT_MAX) <= $maxHeight
+                        : str_starts_with($format['mimeType'], 'audio/mp4; codecs="mp4a.')),
+            );
+            usort($formats, static fn (array $a, array $b): int => [
+                $b['height'] ?? 0,
+                $b['fps'] ?? 0,
+                // AAC-LC first.
+                $b['mimeType'] === 'audio/mp4; codecs="mp4a.40.2"',
+                $b['bitrate'] ?? 0,
+            ] <=> [
+                $a['height'] ?? 0,
+                $a['fps'] ?? 0,
+                $a['mimeType'] === 'audio/mp4; codecs="mp4a.40.2"',
+                $a['bitrate'] ?? 0,
+            ]);
+            return isset($formats[0]) ? ['itag' => $formats[0]['itag'], 'url' => $formats[0]['url']] : null;
         }
 
         /**
-         * Start ffmpeg (again), from the player response of the video if already got.
+         * Get new URLs for the formats, from the first client (starting from the current one) that has them.
+         *
+         * @throws LiveStreamEndedException If the live stream ended.
          */
-        private function start(?array $player = null): void
+        private function refreshUrls(): void
         {
-            $this->stop();
-            $player ??= YouTube::getPlayer($this->videoId, $this->cancellation)[0];
-            if (!($player['videoDetails']['isLive'] ?? false)) {
-                throw new LiveStreamEndedException('The live stream ended');
-            }
-            [$video, $audio] = $this->getPlaylists($player);
-            $this->process = Process::start([
-                'ffmpeg', '-hide_banner', '-nostdin', '-loglevel', 'error',
-                // Give up on a stalled stream, to start again.
-                '-rw_timeout', '30000000', '-i', $video,
-                '-rw_timeout', '30000000', '-i', $audio,
-                // The renditions share their clock: keep it, to keep them in sync (if they start at different times).
-                '-copyts',
-                '-map', '0:v:0', '-map', '1:a:0',
-                '-c:v', 'copy',
-                // The AAC of the stream is encoded again too: ffmpeg can't get its configuration in time for the
-                // header of its output, which isn't seekable.
-                ...($this->aac ? ['-c:a', 'aac', '-b:a', '160k'] : ['-c:a', 'libopus', '-b:a', '128k']),
-                '-ar', '48000', '-ac', '2',
-                '-f', 'matroska', 'pipe:1',
-            ], cancellation: $this->cancellation);
-            $process = $this->process;
-            async(static function () use ($process): void {
-                $errors = trim(buffer($process->getStderr()));
-                if ($errors !== '') {
-                    Logger::log("ffmpeg: $errors", Logger::WARNING);
+            for ($i = 0; $i < YouTube::getClientCount(); $i++) {
+                [$player, $userAgent, $client] = YouTube::getPlayer($this->videoId, $this->cancellation, $this->client + $i);
+                if (!($player['videoDetails']['isLive'] ?? false)) {
+                    throw new LiveStreamEndedException('The live stream ended');
                 }
-            })->ignore();
-            $demuxer = new Matroska($process->getStdout(), $this->cancellation);
-            // The first video and audio tracks.
-            $tracks = $numbers = [];
-            foreach ($demuxer->tracks as $number => $track) {
-                if (isset(self::TRACKS[$track['type']]) && !isset($tracks[$track['type']])) {
-                    $tracks[$track['type']] = ['codec' => $track['codec'], 'private' => $track['private']];
-                    $numbers[$track['type']] = $number;
+                $urls = ['userAgent' => $userAgent];
+                foreach (['video' => $this->video, 'audio' => $this->audio] as $kind => $itag) {
+                    if ($itag === null) {
+                        continue;
+                    }
+                    foreach ($player['streamingData']['adaptiveFormats'] ?? [] as $format) {
+                        if (($format['itag'] ?? null) === $itag && isset($format['url'])) {
+                            $urls[$kind] = $format['url'];
+                            continue 2;
+                        }
+                    }
+                    continue 2;
                 }
+                $this->urls = $urls;
+                $this->client = $client;
+                return;
             }
-            $frames = $demuxer->frames;
-            \assert($frames instanceof Generator);
-            if (!$frames->valid()) {
-                throw new YouTubeException('ffmpeg returned nothing');
-            }
-            if ($this->tracks === []) {
-                $this->tracks = $tracks;
-            } elseif ($tracks != $this->tracks) {
-                throw new LiveStreamEndedException('The format of the live stream changed');
-            }
-            // Continue after the frames already read.
-            $this->offset = $this->readUntil < 0 ? -$frames->current()['timestamp'] : $this->readUntil + self::RESTART_GAP - $frames->current()['timestamp'];
-            $this->frames = $frames;
-            $this->numbers = $numbers;
-            $this->waitKeyframe = isset($tracks[Matroska::TRACK_TYPE_VIDEO]);
-        }
-
-        private function stop(): void
-        {
-            $this->frames = null;
-            if ($this->process?->isRunning()) {
-                $this->process->kill();
-            }
-            $this->process = null;
+            throw new YouTubeException("The formats of the live stream $this->videoId aren't available anymore");
         }
 
         /**
-         * The next frame, restarting ffmpeg if it stopped; null at the end of the live stream.
+         * Fetch a segment of a format: null if it isn't published yet.
          *
-         * @return ?array{track: int, codec: string, type: int, data: string, timestamp: int, keyframe: bool}
+         * @param 'video'|'audio' $kind
+         * @param ?int            $sequence The number of the segment, or null for the latest one.
+         *
+         * @return array{?string, int} The segment, and the number of the latest one.
          */
-        private function nextFrame(): ?array
+        private function fetchSegment(string $kind, ?int $sequence): array
         {
+            $errors = [];
             for ($attempt = 1; ; $attempt++) {
                 try {
-                    if ($this->frames === null) {
-                        $this->start();
+                    if ($this->urls === null) {
+                        $this->refreshUrls();
                     }
-                    while ($this->frames->valid()) {
-                        $frame = $this->frames->current();
-                        $this->frames->next();
-                        if ($frame['track'] !== ($this->numbers[$frame['type']] ?? null)) {
-                            continue;
+                    $request = new Request($this->urls[$kind].($sequence === null ? '' : "&sq=$sequence"));
+                    $request->setHeader('User-Agent', $this->urls['userAgent']);
+                    $request->setTransferTimeout(60);
+                    $request->setInactivityTimeout(30);
+                    $response = YouTube::getClient()->request($request, $this->cancellation);
+                    $body = $response->getBody()->buffer($this->cancellation);
+                    $status = $response->getStatus();
+                    $head = (int) $response->getHeader('x-head-seqnum');
+                    if ($status === 200 && $body !== '') {
+                        return [$body, $head];
+                    }
+                    if (($status === 404 || $status === 204) && $head > 0 && $sequence !== null && $sequence > $head) {
+                        // Not published yet.
+                        return [null, $head];
+                    }
+                    if ($status === 404 && $head > 0 && $sequence !== null) {
+                        // Too old: jump to the live edge.
+                        throw new LiveEdgeException;
+                    }
+                    if ($status === 403 || $status === 410) {
+                        // The URLs expired, or are refused: get new ones, from the next client if they're refused again.
+                        $this->urls = null;
+                        if ($attempt % 2 === 0) {
+                            $this->client++;
                         }
-                        if ($this->waitKeyframe) {
-                            if ($frame['type'] !== Matroska::TRACK_TYPE_VIDEO || !$frame['keyframe']) {
-                                continue;
-                            }
-                            $this->waitKeyframe = false;
-                        }
-                        $frame['timestamp'] += $this->offset;
-                        return $frame;
                     }
-                    Logger::log("ffmpeg stopped playing the live stream $this->videoId, starting it again", Logger::NOTICE);
-                } catch (CancelledException|LiveStreamEndedException $e) {
-                    $this->stop();
-                    if ($e instanceof LiveStreamEndedException) {
-                        Logger::log("Stopped playing the live stream $this->videoId: {$e->getMessage()}", Logger::NOTICE);
-                        return null;
-                    }
+                    throw new YouTubeException("HTTP status $status, got ".\strlen($body).' bytes');
+                } catch (CancelledException|LiveStreamEndedException|LiveEdgeException $e) {
                     throw $e;
                 } catch (Throwable $e) {
+                    $errors[] = $e->getMessage();
                     if ($attempt >= self::ATTEMPTS) {
-                        $this->stop();
-                        throw new YouTubeException("Could not play the live stream $this->videoId: {$e->getMessage()}", 0, $e);
+                        throw new YouTubeException("Could not fetch the $kind of the live stream $this->videoId: ".implode('; ', array_unique($errors)), 0, $e);
                     }
-                    Logger::log("Could not play the live stream $this->videoId, trying again: {$e->getMessage()}", Logger::WARNING);
                     delay($attempt, cancellation: $this->cancellation);
                 }
-                $this->stop();
             }
         }
 
         /**
-         * Whether just the audio will be played, as there's no video.
+         * Read the next segment of the formats into the queue, waiting for it to be published.
+         *
+         * @throws LiveStreamEndedException If the live stream ended.
          */
-        public function isAudioOnly(): bool
+        private function readSegment(): void
         {
-            return !isset($this->tracks[Matroska::TRACK_TYPE_VIDEO]);
+            $kinds = array_keys(array_filter(['video' => $this->video, 'audio' => $this->audio], static fn (?int $itag): bool => $itag !== null));
+            while (true) {
+                $jumped = false;
+                if ($this->sequence === null) {
+                    [, $head] = $this->fetchSegment($kinds[0], null);
+                    $this->sequence = max(0, $head - self::START_BEHIND);
+                    $jumped = true;
+                }
+                try {
+                    $frames = [];
+                    foreach ($kinds as $kind) {
+                        $waited = 0;
+                        while (([$segment] = $this->fetchSegment($kind, $this->sequence))[0] === null) {
+                            if ($waited >= self::PUBLISH_TIMEOUT) {
+                                // Ended, or stalled: check with new URLs.
+                                $this->refreshUrls();
+                                $waited = 0;
+                            }
+                            delay(1, cancellation: $this->cancellation);
+                            $waited++;
+                        }
+                        $frames = [...$frames, ...$this->demux($kind, $segment)];
+                    }
+                } catch (LiveEdgeException) {
+                    $this->sequence = null;
+                    continue;
+                }
+                $this->sequence++;
+                break;
+            }
+            usort($frames, static fn (array $a, array $b): int => [$a['timestamp'], $a['kind'] === 'audio'] <=> [$b['timestamp'], $b['kind'] === 'audio']);
+            if ($frames === []) {
+                return;
+            }
+            if ($jumped) {
+                // Continue right after the frames read before.
+                $this->offset = $this->readUntil < 0 ? -$frames[0]['timestamp'] : $this->readUntil + self::JUMP_GAP - $frames[0]['timestamp'];
+            }
+            foreach ($frames as $frame) {
+                $frame['timestamp'] += $this->offset;
+                $this->queue[] = $frame;
+            }
+        }
+
+        /**
+         * The frames of a segment of a format.
+         *
+         * @param 'video'|'audio' $kind
+         *
+         * @return list<array{kind: 'video'|'audio', data: string, timestamp: int, keyframe: bool}>
+         */
+        private function demux(string $kind, string $segment): array
+        {
+            $codec = self::TRACKS[$kind]['codec'];
+            $demuxer = new Mp4(new ReadableBuffer($segment), $this->cancellation);
+            $private = null;
+            foreach ($demuxer->tracks as $track) {
+                if ($track['codec'] === $codec) {
+                    $private = $track['private'];
+                    break;
+                }
+            }
+            if (!\array_key_exists($kind, $this->privates)) {
+                $this->privates[$kind] = $private;
+            } elseif ($private !== $this->privates[$kind]) {
+                // The header can't change.
+                throw new LiveStreamEndedException("The format of the $kind of the live stream changed");
+            }
+            $frames = [];
+            foreach ($demuxer->frames as $frame) {
+                if ($frame['codec'] === $codec) {
+                    $frames[] = ['kind' => $kind, 'data' => $frame['data'], 'timestamp' => $frame['timestamp'], 'keyframe' => $frame['keyframe']];
+                }
+            }
+            return $frames;
+        }
+
+        /**
+         * Whether just the video will be played, as calls only carry OPUS audio.
+         */
+        public function isVideoOnly(): bool
+        {
+            return $this->audio === null;
         }
 
         #[\Override]
@@ -1755,7 +1817,7 @@ namespace Magnaluna {
             }
             if ($cluster === null) {
                 $this->eof = true;
-                $this->stop();
+                $this->queue = [];
             }
             return $cluster;
         }
@@ -1766,15 +1828,15 @@ namespace Magnaluna {
         private function header(): string
         {
             $tracks = '';
-            foreach ($this->tracks as $type => $track) {
-                $number = self::TRACKS[$type];
+            foreach ($this->privates as $kind => $private) {
+                $track = self::TRACKS[$kind];
                 $tracks .= Ebml::element(
                     self::ID_TRACK_ENTRY,
-                    Ebml::uint(self::ID_TRACK_NUMBER, $number)
-                    .Ebml::uint(self::ID_TRACK_UID, $number)
-                    .Ebml::uint(self::ID_TRACK_TYPE, $type)
+                    Ebml::uint(self::ID_TRACK_NUMBER, $track['number'])
+                    .Ebml::uint(self::ID_TRACK_UID, $track['number'])
+                    .Ebml::uint(self::ID_TRACK_TYPE, $track['type'])
                     .Ebml::element(self::ID_CODEC_ID, $track['codec'])
-                    .($track['private'] === null ? '' : Ebml::element(self::ID_CODEC_PRIVATE, $track['private'])),
+                    .($private === null ? '' : Ebml::element(self::ID_CODEC_PRIVATE, $private)),
                 );
             }
             return Ebml::element(
@@ -1801,41 +1863,44 @@ namespace Magnaluna {
         }
 
         /**
-         * Read the next cluster: the frames up to the next video keyframe, or MAX_CLUSTER_LENGTH.
+         * Read the next cluster: the frames up to the next video keyframe, or MAX_CLUSTER_LENGTH; null at the end of
+         * the live stream.
          */
         private function readCluster(): ?string
         {
+            if ($this->queue === []) {
+                try {
+                    $this->readSegment();
+                } catch (LiveStreamEndedException $e) {
+                    Logger::log("Stopped playing the live stream $this->videoId: {$e->getMessage()}", Logger::NOTICE);
+                    return null;
+                }
+            }
             $clusterTimestamp = null;
             $blocks = '';
-            // A frame read past the end of the previous cluster.
-            $frame = $this->pending ?? $this->nextFrame();
-            $this->pending = null;
-            while ($frame !== null) {
-                $isVideo = $frame['type'] === Matroska::TRACK_TYPE_VIDEO;
+            while ($this->queue !== []) {
+                $frame = $this->queue[0];
+                $isVideo = $frame['kind'] === 'video';
                 if ($clusterTimestamp === null) {
                     $clusterTimestamp = $frame['timestamp'];
                 } elseif (($isVideo && $frame['keyframe']) || $frame['timestamp'] - $clusterTimestamp > self::MAX_CLUSTER_LENGTH) {
-                    $this->pending = $frame;
                     break;
                 }
+                array_shift($this->queue);
                 $blocks .= Ebml::element(
                     self::ID_SIMPLE_BLOCK,
-                    \chr(0x80 | self::TRACKS[$frame['type']])
+                    \chr(0x80 | self::TRACKS[$frame['kind']]['number'])
                     .pack('n', ($frame['timestamp'] - $clusterTimestamp) & 0xFFFF)
                     .\chr($frame['keyframe'] || !$isVideo ? 0x80 : 0)
                     .$frame['data'],
                 );
                 $this->readUntil = max($this->readUntil, $frame['timestamp']);
-                $frame = $this->nextFrame();
             }
             if ($clusterTimestamp === null) {
                 return null;
             }
             return Ebml::element(self::ID_CLUSTER, Ebml::uint(self::ID_TIMESTAMP, $clusterTimestamp).$blocks);
         }
-
-        /** @var ?array{track: int, codec: string, type: int, data: string, timestamp: int, keyframe: bool} */
-        private ?array $pending = null;
 
         /** @psalm-mutation-free */
         #[\Override]
@@ -1848,7 +1913,7 @@ namespace Magnaluna {
         public function close(): void
         {
             $this->closed = true;
-            $this->stop();
+            $this->queue = [];
             if (!$this->onClose->isComplete()) {
                 $this->onClose->complete();
             }
@@ -1872,9 +1937,10 @@ namespace Magnaluna {
             return [
                 'videoId' => $this->videoId,
                 'title' => $this->title,
-                'aac' => $this->aac,
-                'maxHeight' => $this->maxHeight,
-                'tracks' => $this->tracks,
+                'video' => $this->video,
+                'audio' => $this->audio,
+                'client' => $this->client,
+                'privates' => $this->privates,
                 'readUntil' => $this->readUntil,
                 'headerRead' => $this->headerRead,
                 'eof' => $this->eof,
@@ -1885,18 +1951,14 @@ namespace Magnaluna {
         {
             $this->videoId = $data['videoId'];
             $this->title = $data['title'];
-            $this->aac = $data['aac'];
-            $this->maxHeight = $data['maxHeight'];
-            $this->tracks = $data['tracks'];
+            $this->video = $data['video'];
+            $this->audio = $data['audio'];
+            $this->client = $data['client'];
+            $this->privates = $data['privates'];
             $this->readUntil = $data['readUntil'];
             $this->headerRead = $data['headerRead'];
             $this->eof = $data['eof'];
             $this->onClose = new DeferredFuture;
-        }
-
-        public function __destruct()
-        {
-            $this->stop();
         }
     }
 
@@ -1904,6 +1966,13 @@ namespace Magnaluna {
      * A live stream ended, or can't be continued.
      */
     final class LiveStreamEndedException extends RuntimeException
+    {
+    }
+
+    /**
+     * A segment of a live stream isn't available anymore: playback continues from the live edge.
+     */
+    final class LiveEdgeException extends RuntimeException
     {
     }
 }
@@ -2230,7 +2299,13 @@ namespace {
                 } catch (YouTubeException $e) {
                     throw new InvalidArgumentException("I can't play this YouTube video: {$e->getMessage()}");
                 }
-                return [$video, $video->isAudioOnly() ? " ({$video->title}, just its audio)" : " ({$video->title})"];
+                return [$video, match (true) {
+                    $video instanceof YouTubeLiveStream => $video->isVideoOnly()
+                        ? " ({$video->title}, live, just its video: YouTube live streams only have AAC audio, which calls can't play, only RTMP livestreams)"
+                        : " ({$video->title}, live)",
+                    $video->isAudioOnly() => " ({$video->title}, just its audio)",
+                    default => " ({$video->title})",
+                }];
             }
             if (filter_var($url, FILTER_VALIDATE_URL) === false
                 || !in_array(strtolower((string) parse_url($url, PHP_URL_SCHEME)), ['http', 'https'], true)
