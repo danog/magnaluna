@@ -1742,7 +1742,8 @@ namespace Magnaluna {
                     $frames = [];
                     foreach ($kinds as $kind) {
                         $waited = 0;
-                        while (([$segment] = $this->fetchSegment($kind, $this->sequence))[0] === null) {
+                        $since = microtime(true);
+                        while (([$segment, $head] = $this->fetchSegment($kind, $this->sequence))[0] === null) {
                             if ($waited >= self::PUBLISH_TIMEOUT) {
                                 // Ended, or stalled: check with new URLs.
                                 $this->refreshUrls();
@@ -1751,6 +1752,7 @@ namespace Magnaluna {
                             delay(1, cancellation: $this->cancellation);
                             $waited++;
                         }
+                        Logger::log(sprintf("Got the segment %d (head %d) of the %s of the live stream %s: %d bytes in %.2f seconds, %d waiting", $this->sequence, $head, $kind, $this->videoId, \strlen($segment), microtime(true) - $since, $waited), Logger::VERBOSE);
                         $frames = [...$frames, ...$this->demux($kind, $segment)];
                     }
                 } catch (LiveEdgeException) {
