@@ -2159,15 +2159,16 @@ namespace {
          * Reply to a message, unless we may not write in its chat (a group where we're restricted, a channel's
          * discussion group we didn't join): the command was carried out anyway.
          */
-        private function respond(Message $message, mixed ...$args): void
+        private function respond(Message $to, mixed ...$args): void
         {
+            // Not named $message, which callers pass as a named argument of reply().
             try {
-                $message->reply(...$args);
+                $to->reply(...$args);
             } catch (RPCErrorException $e) {
                 if (!in_array($e->rpc, self::CANT_WRITE, true) && !str_starts_with($e->rpc, 'SLOWMODE_WAIT')) {
                     throw $e;
                 }
-                $this->logger("Could not reply in {$message->chatId}: {$e->rpc}", Logger::NOTICE);
+                $this->logger("Could not reply in {$to->chatId}: {$e->rpc}", Logger::NOTICE);
             }
         }
 
