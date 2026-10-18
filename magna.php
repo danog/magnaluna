@@ -1583,21 +1583,58 @@ namespace {
             if ($peer > 0) {
                 return $peer === $userId;
             }
+            // Getting the RTMP key of a livestream takes the right to manage its calls.
+            return $this->getRole($peer, $userId) === self::ROLE_CALLS;
+        }
+
+        /**
+         * Whether a group or channel is public, i.e. has a username.
+         */
+        private static function isPublic(array $chat): bool
+        {
+            if (isset($chat['username'])) {
+                return true;
+            }
+            foreach ($chat['usernames'] ?? [] as $username) {
+                if ($username['active'] ?? false) {
+                    return true;
+                }
+            }
+            return false;
+        }
+
+        /** A member of a group or channel. */
+        private const ROLE_MEMBER = 'member';
+        /** A member of a group or channel who may manage its calls: its creator, or an admin with that right. */
+        private const ROLE_CALLS = 'calls';
+
+        /**
+         * The role of a user in a group or channel (one of the ROLE_* constants), or null if they aren't in it.
+         *
+         * @return self::ROLE_*|null
+         */
+        private function getRole(int $peer, int $userId): ?string
+        {
             try {
                 if (DialogId::isSupergroupOrChannel($peer)) {
                     $participant = $this->channels->getParticipant(channel: $peer, participant: $userId)['participant'];
-                    // Getting the RTMP key of a livestream takes the right to manage its calls.
-                    return $participant['_'] === 'channelParticipantCreator'
-                        || ($participant['_'] === 'channelParticipantAdmin' && ($participant['admin_rights']['manage_call'] ?? false));
+                    return match ($participant['_']) {
+                        'channelParticipantCreator' => self::ROLE_CALLS,
+                        'channelParticipantAdmin' => ($participant['admin_rights']['manage_call'] ?? false) ? self::ROLE_CALLS : self::ROLE_MEMBER,
+                        'channelParticipantLeft' => null,
+                        'channelParticipantBanned' => ($participant['left'] ?? false) ? null : self::ROLE_MEMBER,
+                        default => self::ROLE_MEMBER,
+                    };
                 }
                 foreach ($this->messages->getFullChat(chat_id: $peer)['full_chat']['participants']['participants'] ?? [] as $participant) {
                     if ($participant['user_id'] === $userId) {
-                        return in_array($participant['_'], ['chatParticipantCreator', 'chatParticipantAdmin'], true);
+                        // The admins of basic groups have every right.
+                        return $participant['_'] === 'chatParticipant' ? self::ROLE_MEMBER : self::ROLE_CALLS;
                     }
                 }
             } catch (RPCErrorException) {
             }
-            return false;
+            return null;
         }
 
         private const NOT_LIVESTREAM_ADMIN = "Only the admins of this livestream's group or channel can choose what I play in it.";
@@ -1871,11 +1908,102 @@ namespace {
                 $message->reply($this->notInCall($message));
                 return;
             }
+            if (!$this->mayControl($call, $message->senderId)) {
+                $message->reply(self::NOT_LIVESTREAM_ADMIN);
+                return;
+            }
             try {
                 $call->leave();
                 $message->reply('Left the video chat! Send /join to make me join it again.');
             } catch (Throwable $e) {
                 $message->reply("Could not leave the video chat: {$e->getMessage()}");
+            }
+        }
+
+        /**
+         * Join the video chat or livestream of a group or channel from our private chat, to keep the commands out
+         * of it (starting one if none is running, and both we and the user may), and play the video.
+         *
+         * The commands sent in our private chat then control it.
+         */
+        #[FiltersOr(new FilterCommand('join'), new FilterCommand('videochat'))]
+        public function joinPrivateCommand(Incoming&PrivateMessage $message): void
+        {
+            $arg = $message->commandArgs[0] ?? null;
+            if ($arg === null) {
+                $message->reply('Send /join <username or link of a group or channel> to make me join its video chat or livestream, then send me /play, /loop, /skip and /leave here to control it.');
+                return;
+            }
+            try {
+                $peer = $this->getId($arg);
+            } catch (Throwable) {
+                $peer = null;
+            }
+            if ($peer === null || $peer > 0) {
+                $message->reply("$arg is not a group or channel I'm in.");
+                return;
+            }
+            // Only those who could send /join in the group, or watch the video chat of the channel: anyone, if it's
+            // public, as they could send its link (and only admins can check who is in a channel).
+            $role = in_array($message->senderId, self::ADMINS, true)
+                ? self::ROLE_CALLS
+                : $this->getRole($peer, $message->senderId);
+            if ($role === null && self::isPublic($this->getInfo($peer)['Chat'] ?? [])) {
+                $role = self::ROLE_MEMBER;
+            }
+            if ($role === null) {
+                $message->reply("Only the members of $arg can make me join its video chat.");
+                return;
+            }
+            try {
+                $call = $this->getGroupCall($peer);
+                $joined = $call?->isJoined() ?? false;
+                if ($call === null) {
+                    if ($role !== self::ROLE_CALLS) {
+                        $message->reply("There's no video chat in $arg: only its admins who can manage video chats can make me start one.");
+                        return;
+                    }
+                    $call = $this->createGroupCall($peer);
+                }
+                $call->join();
+                if (!$this->mayControl($call, $message->senderId)) {
+                    if (!$joined) {
+                        $call->leave();
+                    }
+                    $message->reply(self::NOT_LIVESTREAM_ADMIN);
+                    return;
+                }
+                $this->broadcast($call);
+                $this->linkedCalls[$message->chatId] = $call->id;
+                $message->reply('Playing in the video chat! Send me /play, /loop, /skip and /leave here to control it.');
+            } catch (Throwable $e) {
+                $message->reply("Could not join the video chat: {$e->getMessage()}");
+            }
+        }
+
+        /**
+         * Leave the video chat or conference call controlled from our private chat.
+         */
+        #[FilterCommand('leave')]
+        public function leavePrivateCommand(Incoming&PrivateMessage $message): void
+        {
+            $id = $this->linkedCalls[$message->chatId] ?? null;
+            $call = $id === null ? null : $this->getMultiCall($id);
+            if ($call === null) {
+                unset($this->linkedCalls[$message->chatId]);
+                $message->reply("I'm not in a video chat or conference call controlled from here: send /join <group or channel>, or the link of a call, first!");
+                return;
+            }
+            if (!$this->mayControl($call, $message->senderId)) {
+                $message->reply(self::NOT_LIVESTREAM_ADMIN);
+                return;
+            }
+            try {
+                $call->leave();
+                unset($this->linkedCalls[$message->chatId]);
+                $message->reply('Left the call!');
+            } catch (Throwable $e) {
+                $message->reply("Could not leave the call: {$e->getMessage()}");
             }
         }
 
@@ -2049,10 +2177,10 @@ Commands:
   /program 29 August 2018 - call me the 29th of august 2018
   /program +1 hour 30 minutes - call me in one hour and thirty minutes
   /program next Thursday - call me next Thursday at midnight
-/join (or /videochat) - in a group, join its video chat (or start one, if I'm allowed to)
-/leave - in a group or in the chat of a call, leave its video chat or conference call
+/join (or /videochat) - in a group, join its video chat (or start one, if I'm allowed to); here, send /join <username or link of a group or channel> to do the same without sending commands there
+/leave - leave the video chat or conference call (in the group, in the chat of the call, or here if you made me join it from here)
 
-During a call, change what I play (in our private chat, in the group, or in the chat of the call):
+During a call, change what I play (in our private chat, in the group, or in the chat of the call), only as an admin in livestreams:
 /play - reply to a video or audio file (or send /play <URL>, even of a YouTube video) to add it to the playlist
 /skip - skip the file being played
 /loop - reply to a file (or send /loop <URL>, even of a YouTube video) to loop it instead of my video when the playlist is empty, send just /loop to loop nothing, /loop default to loop my video again
