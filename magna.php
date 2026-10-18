@@ -1663,7 +1663,7 @@ namespace {
                 return null;
             }
             try {
-                $peer = $this->getId($link ? '@'.$matches[1] : $arg);
+                $peer = $this->getId($link ? '@'.$matches[1] : (is_numeric($arg) ? (int) $arg : $arg));
             } catch (Throwable) {
                 $peer = null;
             }
@@ -1694,9 +1694,11 @@ namespace {
          * passed as its first argument, or else the call of the chat it was sent in (our call with a user, or the
          * video chat of a group).
          *
+         * @param bool $join Whether to join the call passed to it, if we're not in it.
+         *
          * @return array{Call, list<string>}|string The call and the other arguments, or why there is none.
          */
-        private function getCallFor(Message $message): array|string
+        private function getCallFor(Message $message, bool $join = false): array|string
         {
             $args = $message->commandArgs ?? [];
             try {
@@ -1712,9 +1714,14 @@ namespace {
                         ? $this->getConferenceCallBySlug($target['slug'])
                         : $this->getGroupCall($target['peer']);
                     if (!$call?->isJoined()) {
-                        return "I'm not in the call of $where: send /join $where first!";
-                    }
-                    if (!$target['link'] && $this->getAccess($target['peer'], $message->senderId) === null) {
+                        if (!$join) {
+                            return "I'm not in the call of $where: send /join $where first!";
+                        }
+                        $call = $this->joinCall($message, $target, $where);
+                        if (is_string($call)) {
+                            return $call;
+                        }
+                    } elseif (!$target['link'] && $this->getAccess($target['peer'], $message->senderId) === null) {
                         return "Only the members of $where can change what I play there.";
                     }
                 }
@@ -1830,7 +1837,7 @@ namespace {
         #[FilterCommand('play')]
         public function playCommand(Incoming&Message $message): void
         {
-            $target = $this->getCallFor($message);
+            $target = $this->getCallFor($message, join: true);
             if (is_string($target)) {
                 $message->reply($target);
                 return;
@@ -1849,7 +1856,7 @@ namespace {
         #[FilterCommand('loop')]
         public function loopCommand(Incoming&Message $message): void
         {
-            $target = $this->getCallFor($message);
+            $target = $this->getCallFor($message, join: true);
             if (is_string($target)) {
                 $message->reply($target);
                 return;
@@ -1944,7 +1951,23 @@ namespace {
                 $message->reply('Send /join <username or link of a group or channel, or link of a call> to make me join its video chat, livestream or conference call (or just /join in a group).');
                 return;
             }
-            $message->reply($this->joinCall($message, $target, $where));
+            $message->reply(self::joinedReply($this->joinCall($message, $target, $where), $where));
+        }
+
+        /**
+         * The reply to a request to join a call.
+         *
+         * @param MultiCall|string $call The call joined, or why we couldn't join it.
+         * @param ?string          $where How the call was referred to, if not as the group the request was sent in.
+         */
+        private static function joinedReply(MultiCall|string $call, ?string $where): string
+        {
+            if (is_string($call)) {
+                return $call;
+            }
+            return $where === null
+                ? 'Playing in the video chat!'
+                : "Joined! Send /play $where, /loop $where, /skip $where or /leave $where (here, or anywhere else) to control what I play there.";
         }
 
         /**
@@ -1953,9 +1976,9 @@ namespace {
          *
          * @param ?array{peer: ?int, slug: ?string, inviteHash: ?string, link: bool} $target
          *
-         * @return string The reply.
+         * @return MultiCall|string The call, or why we couldn't join it.
          */
-        private function joinCall(Message $message, ?array $target, ?string $where): string
+        private function joinCall(Message $message, ?array $target, ?string $where): MultiCall|string
         {
             try {
                 if ($target === null) {
@@ -1992,9 +2015,7 @@ namespace {
                     return self::NOT_LIVESTREAM_ADMIN;
                 }
                 $this->broadcast($call);
-                return $target === null
-                    ? 'Playing in the video chat!'
-                    : "Joined! Send /play $where, /loop $where, /skip $where or /leave $where (here, or anywhere else) to control what I play there.";
+                return $call;
             } catch (CallNotAllowedException $e) {
                 return "I can't start a video chat here: {$e->reason->value}";
             } catch (InvalidArgumentException $e) {
@@ -2049,7 +2070,7 @@ namespace {
                 $message->reply($e->getMessage());
                 return;
             }
-            $message->reply($this->joinCall($message, $target, $matches[0]));
+            $message->reply(self::joinedReply($this->joinCall($message, $target, $matches[0]), $matches[0]));
         }
 
         private int $lastLog = 0;
@@ -2187,7 +2208,7 @@ Commands:
 The commands apply to our call, or to the video chat of the group they're sent in.
 To use them for another video chat, livestream or conference call without sending them in its chat (even from here), put its group or channel (username, link or ID) or its link right after the command, for example:
   /join @mygroup
-  /play @mygroup https://youtu.be/dQw4w9WgXcQ
+  /play @mygroup https://youtu.be/dQw4w9WgXcQ (/play and /loop join the call first, if needed)
   /loop https://t.me/call/... default
   /leave @mygroup
 In the chat of a call, the commands apply to that call (/play and /loop only take URLs there).
