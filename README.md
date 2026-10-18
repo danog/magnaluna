@@ -1,6 +1,6 @@
 # magnaluna webradio
 
-Telegram video webradio based on [MadelineProto](https://github.com/danog/MadelineProto): it plays videos, music, YouTube videos and YouTube live streams in the video chats and RTMP livestreams of groups and channels, in end-to-end encrypted conference calls and in one-to-one video calls, entirely in pure PHP (no ffmpeg needed).
+Telegram video webradio based on [MadelineProto](https://github.com/danog/MadelineProto): it plays videos, music, YouTube videos, playlists and live streams in the video chats and RTMP livestreams of groups and channels, in end-to-end encrypted conference calls and in one-to-one video calls, entirely in pure PHP (no ffmpeg needed).
 
 Try it on Telegram [@magicalcrazypony](https://t.me/magicalcrazypony)!
 
@@ -29,7 +29,7 @@ The admins of a group or channel can also keep its video chat to themselves with
 
 | Command | |
 |---|---|
-| `/play` | Reply to a video or audio file, or send `/play <URL>` (even of a YouTube video or live stream), to add it to the playlist |
+| `/play` | Reply to a video or audio file, or send `/play <URL>` (even of a YouTube video, playlist or live stream), to add it to the playlist |
 | `/skip` | Skip the file being played |
 | `/loop` | Reply to a file, or send `/loop <URL>`, to loop it instead of the default video when the playlist is empty; just `/loop` loops nothing, `/loop default` loops the default video again |
 | `/join`, `/videochat` | Join (or start) the video chat of the group |
@@ -58,6 +58,7 @@ Telegram files are streamed, never downloaded, and so are URLs:
 - in RTMP livestreams: MP4 or Matroska files with H.264 video and AAC audio.
 
 YouTube videos are played in up to 1080p in calls (VP9 and OPUS) and 720p in livestreams (H.264 and AAC), and YouTube live streams too (in calls, just their video, as YouTube only serves them with AAC audio).
+YouTube playlists (and Mixes) are queued whole, up to their first 200 videos (25 for a Mix), starting from the video of the link if it has one; each video is only opened when its turn comes, and one that can't be played is skipped. The link of a video opened from a Mix plays just that video.
 This is all done in pure PHP (see the `Magnaluna` namespace in `magna.php`): like yt-dlp, the formats are got with the visionOS InnerTube client and a visitor ID, which need no JavaScript player nor PO token; video and audio are fetched a range (or a live segment) at a time, and muxed into a single file on the fly.
 Playback is resumable: when magnaluna restarts, a video resumes where it was, and a live stream from its live edge.
 

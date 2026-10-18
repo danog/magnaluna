@@ -444,6 +444,11 @@ namespace Magnaluna {
         private const VISITOR_DATA_TTL = 6 * 3600;
         /** YouTube video links: https://www.youtube.com/watch?v=<id>, https://youtu.be/<id>, https://www.youtube.com/shorts/<id>, and so on. */
         private const LINK = '~^(?:https?://)?(?:(?:www|m|music)\.)?(?:youtube(?:-nocookie)?\.com/(?:watch\?(?:\S*?&)?v=|shorts/|live/|embed/|v/)|youtu\.be/)([\w-]{11})(?![\w-])~i';
+        /** YouTube playlist links: https://www.youtube.com/playlist?list=<id>, or the link of a video in it, https://www.youtube.com/watch?v=<video>&list=<id>. */
+        private const PLAYLIST_LINK = '~^(?:https?://)?(?:(?:www|m|music)\.)?(?:youtube(?:-nocookie)?\.com|youtu\.be)/\S*?[?&]list=([\w-]+)~i';
+        private const NEXT_URL = 'https://www.youtube.com/youtubei/v1/next?prettyPrint=false';
+        /** The client to get playlists with: they're listed the same to every client. */
+        private const WEB_CLIENT = ['clientName' => 'WEB', 'clientVersion' => '2.20250925.01.00'];
 
         private static ?HttpClient $client = null;
         /** @var array{string, int}|null The visitor ID, and when it was got. */
@@ -486,6 +491,62 @@ namespace Magnaluna {
         public static function parseLink(string $link): ?string
         {
             return preg_match(self::LINK, $link, $matches) ? $matches[1] : null;
+        }
+
+        /**
+         * The ID of the playlist a YouTube link points to, or null if it isn't one.
+         *
+         * The link of a video in a Mix (an endless playlist made by YouTube, "RD..."), as YouTube links the videos
+         * opened from its recommendations, is just the link of the video.
+         */
+        public static function parsePlaylistLink(string $link): ?string
+        {
+            if (!preg_match(self::PLAYLIST_LINK, $link, $matches)) {
+                return null;
+            }
+            return str_starts_with($matches[1], 'RD') && self::parseLink($link) !== null ? null : $matches[1];
+        }
+
+        /**
+         * Get the title and the videos of a playlist, from the playlist panel of its watch page (which, unlike
+         * the playlist page, also lists the videos of Mixes): at most the first 200 videos, or the first 25
+         * of a Mix, starting from the given video if it's in it.
+         *
+         * @return array{string, list<string>} The title, and the IDs of the videos.
+         *
+         * @throws YouTubeException If it can't be got.
+         */
+        public static function getPlaylist(string $playlistId, ?string $videoId = null, ?Cancellation $cancellation = null): array
+        {
+            $request = new Request(self::NEXT_URL, 'POST', json_encode([
+                'context' => ['client' => self::WEB_CLIENT + ['hl' => 'en', 'gl' => 'US']],
+                'playlistId' => $playlistId,
+            ] + ($videoId === null ? [] : ['videoId' => $videoId]), JSON_THROW_ON_ERROR));
+            $request->setHeader('Content-Type', 'application/json');
+            $request->setHeader('User-Agent', self::WEB_USER_AGENT);
+            $request->setHeader('Origin', 'https://www.youtube.com');
+            $response = self::getClient()->request($request, $cancellation);
+            $next = json_decode($response->getBody()->buffer($cancellation), true);
+            $playlist = $next['contents']['twoColumnWatchNextResults']['playlist']['playlist'] ?? null;
+            if (!\is_array($playlist)) {
+                throw new YouTubeException(\is_array($next)
+                    ? "This playlist doesn't exist or is private"
+                    : "HTTP error {$response->getStatus()}");
+            }
+            $videoIds = [];
+            foreach ($playlist['contents'] ?? [] as $item) {
+                if (isset($item['playlistPanelVideoRenderer']['videoId'])) {
+                    $videoIds[] = $item['playlistPanelVideoRenderer']['videoId'];
+                }
+            }
+            $start = $videoId === null ? false : array_search($videoId, $videoIds, true);
+            if ($start !== false) {
+                $videoIds = \array_slice($videoIds, $start);
+            }
+            if ($videoIds === []) {
+                throw new YouTubeException('This playlist is empty');
+            }
+            return [$playlist['title'] ?? $playlistId, $videoIds];
         }
 
         /**
@@ -1474,6 +1535,104 @@ namespace Magnaluna {
     }
 
     /**
+     * A video of a YouTube playlist, opened when it's first read: the videos of a playlist are queued all at
+     * once, but each is only opened (with fresh URLs) when its turn comes.
+     *
+     * A video that can't be played makes the first read throw, which skips it.
+     *
+     * @implements IteratorAggregate<int, string>
+     */
+    final class YouTubePlaylistEntry implements ReadableStream, ResumableStream, IteratorAggregate
+    {
+        use ReadableStreamIteratorAggregate;
+        use ForbidCloning;
+
+        private YouTubeStream|YouTubeMp4Stream|YouTubeLiveStream|null $stream = null;
+        private bool $closed = false;
+        private DeferredFuture $onClose;
+
+        /**
+         * @param string $videoId The ID of the video.
+         * @param bool   $rtmp    Whether it's played in an RTMP livestream, see {@see YouTubeMp4Stream}, or else
+         *                        in a call, see {@see YouTubeStream}.
+         */
+        public function __construct(public readonly string $videoId, public readonly bool $rtmp)
+        {
+            $this->onClose = new DeferredFuture;
+        }
+
+        #[\Override]
+        public function read(?Cancellation $cancellation = null): ?string
+        {
+            if ($this->closed) {
+                return null;
+            }
+            if ($this->stream === null) {
+                try {
+                    $this->stream = $this->rtmp
+                        ? YouTubeMp4Stream::open($this->videoId, cancellation: $cancellation)
+                        : YouTubeStream::open($this->videoId, cancellation: $cancellation);
+                } catch (YouTubeException $e) {
+                    throw new YouTubeException("Can't play the playlist video $this->videoId: {$e->getMessage()}", 0, $e);
+                }
+                if ($this->closed) {
+                    // Closed (skipped) while it was being opened.
+                    $this->stream->close();
+                    return null;
+                }
+            }
+            return $this->stream->read($cancellation);
+        }
+
+        /** @psalm-mutation-free */
+        #[\Override]
+        public function isReadable(): bool
+        {
+            return !$this->closed && ($this->stream?->isReadable() ?? true);
+        }
+
+        #[\Override]
+        public function close(): void
+        {
+            $this->closed = true;
+            $this->stream?->close();
+            if (!$this->onClose->isComplete()) {
+                $this->onClose->complete();
+            }
+        }
+
+        /** @psalm-mutation-free */
+        #[\Override]
+        public function isClosed(): bool
+        {
+            return !$this->isReadable();
+        }
+
+        #[\Override]
+        public function onClose(Closure $onClose): void
+        {
+            $this->onClose->getFuture()->finally($onClose);
+        }
+
+        /**
+         * The video, and where it was if it was opened.
+         */
+        public function __serialize(): array
+        {
+            return ['videoId' => $this->videoId, 'rtmp' => $this->rtmp, 'stream' => $this->stream, 'closed' => $this->closed];
+        }
+
+        public function __unserialize(array $data): void
+        {
+            $this->videoId = $data['videoId'];
+            $this->rtmp = $data['rtmp'];
+            $this->stream = $data['stream'];
+            $this->closed = $data['closed'];
+            $this->onClose = new DeferredFuture;
+        }
+    }
+
+    /**
      * A YouTube live stream, as a Matroska file with H.264 video and AAC audio, that can be played in calls (just its
      * video: calls only carry OPUS audio) and in RTMP livestreams.
      *
@@ -2051,6 +2210,7 @@ namespace {
     use Magnaluna\YouTubeException;
     use Magnaluna\YouTubeLiveStream;
     use Magnaluna\YouTubeMp4Stream;
+    use Magnaluna\YouTubePlaylistEntry;
     use Magnaluna\YouTubeStream;
 
     /**
@@ -2365,11 +2525,12 @@ namespace {
         }
 
         /**
-         * Parse the URL of a file to play (or of a YouTube video), along with a note on how it will be played.
+         * Parse the URL of a file to play (or of a YouTube video or playlist), along with a note on how it will be
+         * played.
          *
          * @param bool $rtmp Whether it's played in an RTMP livestream, which only carries H.264 video and AAC audio.
          *
-         * @return array{RemoteUrl|YouTubeStream|YouTubeMp4Stream|YouTubeLiveStream, string, ?bool} The file, the note,
+         * @return array{RemoteUrl|YouTubeStream|YouTubeMp4Stream|YouTubeLiveStream|non-empty-list<YouTubePlaylistEntry>, string, ?bool} The file (or the videos of a playlist), the note,
          *                                                                                      and whether it would
          *                                                                                      be played better in an
          *                                                                                      RTMP livestream (true)
@@ -2380,6 +2541,25 @@ namespace {
          */
         private static function parseUrl(string $url, bool $rtmp): array
         {
+            if ($playlistId = YouTube::parsePlaylistLink($url)) {
+                $videoId = YouTube::parseLink($url);
+                try {
+                    [$title, $videoIds] = YouTube::getPlaylist($playlistId, $videoId);
+                } catch (YouTubeException $e) {
+                    throw new InvalidArgumentException("I can't play this YouTube playlist: {$e->getMessage()}");
+                }
+                $count = count($videoIds);
+                $what = $count === 1 ? 'the video' : "the $count videos";
+                $from = $videoId !== null && $videoIds[0] === $videoId && $count > 1
+                    ? ", starting from the one you sent: send https://youtu.be/$videoId to play just that one"
+                    : '';
+                // Each video is opened when its turn comes: one that can't be played is skipped.
+                return [
+                    array_map(static fn (string $id): YouTubePlaylistEntry => new YouTubePlaylistEntry($id, $rtmp), $videoIds),
+                    " ($what of the playlist $title$from)",
+                    null,
+                ];
+            }
             if ($videoId = YouTube::parseLink($url)) {
                 try {
                     $video = $rtmp ? YouTubeMp4Stream::open($videoId) : YouTubeStream::open($videoId);
@@ -2445,7 +2625,7 @@ namespace {
                 return [$isVideo ? ' (just its audio: send a WebM or MKV file with VP8, VP9, H.264 or H.265 video to play the video, too)' : '', $aac ? true : null];
             }
             if ($aac) {
-                throw new WrongModeException("I can't play this file in a video chat, which only plays OPUS audio: its AAC audio can only be played in an RTMP livestream.", true);
+                throw new WrongModeException("I can't play this file here: calls and video chats only play OPUS audio, and I can't convert its AAC audio without ffmpeg.", true);
             }
             throw new InvalidArgumentException("I can't play this file: send me a WebM or MKV video (VP8, VP9, H.264 or H.265 with OPUS audio), or an audio file.");
         }
@@ -2455,7 +2635,7 @@ namespace {
          * passed to it (if any), the file it was sent with or the file it replies to (streamed, not downloaded);
          * null if none.
          *
-         * @return array{RemoteUrl|ReadableStream, string, ?bool}|null The file, the note, and whether it would be played
+         * @return array{RemoteUrl|ReadableStream|non-empty-list<ReadableStream>, string, ?bool}|null The file (or the videos of a playlist), the note, and whether it would be played
          *                                                         better in an RTMP livestream (true) or a video chat
          *                                                         (false), if not where requested.
          *
@@ -2479,25 +2659,32 @@ namespace {
         }
 
         /**
-         * Add a file to the playlist of a call, interrupting the looped file.
+         * Add a file (or the videos of a YouTube playlist) to the playlist of a call, interrupting the looped file.
+         *
+         * @param LocalFile|RemoteUrl|ReadableStream|non-empty-list<ReadableStream> $file
          */
-        private function enqueue(Call $call, LocalFile|RemoteUrl|ReadableStream $file, string $note): string
+        private function enqueue(Call $call, LocalFile|RemoteUrl|ReadableStream|array $file, string $note): string
         {
-            $call->then($file);
+            foreach (is_array($file) ? $file : [$file] as $item) {
+                $call->then($item);
+            }
             return "Added to the playlist$note! Send /skip to skip the file being played.";
         }
 
         /**
-         * Change (or remove, if null) the file looped in a call while its playlist is empty.
+         * Change (or remove, if null) the file (or the videos of a YouTube playlist) looped in a call while its
+         * playlist is empty.
+         *
+         * @param LocalFile|RemoteUrl|ReadableStream|non-empty-list<ReadableStream>|null $file
          */
-        private function setLoop(Call $call, LocalFile|RemoteUrl|ReadableStream|null $file, string $note): string
+        private function setLoop(Call $call, LocalFile|RemoteUrl|ReadableStream|array|null $file, string $note): string
         {
             if ($file === null) {
                 $call->playOnHold();
                 return 'Not looping anything anymore: nothing plays when the playlist is empty. Send /loop default to loop the default video again.';
             }
-            $call->playOnHold(MediaDestination::Camera, $file);
-            return "Now looping this file$note when the playlist is empty!";
+            $call->playOnHold(MediaDestination::Camera, ...(is_array($file) ? $file : [$file]));
+            return (is_array($file) ? 'Now looping this playlist' : 'Now looping this file')."$note when the playlist is empty!";
         }
 
         #[FilterCommand('play')]
@@ -2599,8 +2786,12 @@ namespace {
                 : 'a video chat';
             $peer = $call instanceof GroupCall ? $call->peerId : null;
             if ($peer === null || $peer > 0) {
-                // Not the call of a group or channel.
-                return [$call, $rtmp ? 'Only RTMP livestreams can play its AAC audio.' : 'Only video chats can play it.'];
+                // Not the call of a group or channel, which can't be recreated as the other kind.
+                if (!$rtmp) {
+                    return [$call, 'Only video chats can play it.'];
+                }
+                $here = $call instanceof PrivateCall ? 'Calls with users' : 'Conference calls';
+                return [$call, "$here only play OPUS audio (other audio is converted with ffmpeg, if installed, without the video): AAC audio and H.264 video are only played as they are in the RTMP livestreams of groups and channels. To play it in one, send the same command with the group or channel right after it, e.g. /play @mygroup <URL> (I must be an admin who can manage its video chats)."];
             }
             $role = in_array($userId, self::ADMINS, true) ? self::ROLE_CALLS : $this->getRole($peer, $userId);
             if ($role !== self::ROLE_CALLS) {
@@ -3016,7 +3207,7 @@ namespace {
                 // So are the commands for other calls.
                 $isCallLink = preg_match(self::CONFERENCE_LINK, $message->message) || preg_match(self::GROUP_CALL_LINK, $message->message)
                     || in_array($message->command, ['join', 'videochat', 'leave', 'play', 'loop', 'skip', 'adminonly'], true);
-                if (!isset($this->my_users[$message->chatId]) || $message->message === '/start') {
+                if (!isset($this->my_users[$message->chatId]) || in_array($message->message, ['/start', '/help'], true)) {
                     $runCall = true;
                     $this->my_users[$message->chatId] = true;
                     $this->respond($message, 
@@ -3028,7 +3219,7 @@ Send me the link of a video chat, livestream or conference call, and I'll join i
 Add me to your group and send /join to make me join its video chat.
 
 Commands:
-/start - show this message
+/start (or /help) - show this message
 /call - make me call you
 /program <time> - program a call, for example:
   /program 29 August 2018 - call me the 29th of august 2018
@@ -3036,9 +3227,9 @@ Commands:
   /program next Thursday - call me next Thursday at midnight
 /join (or /videochat) - join the video chat of the group (or start one, if I'm allowed to)
 /leave - leave the video chat of the group
-/play - reply to a video or audio file (or send /play <URL>, even of a YouTube video or live stream) to add it to the playlist
+/play - reply to a video or audio file (or send /play <URL>, even of a YouTube video, playlist or live stream) to add it to the playlist
 /skip - skip the file being played
-/loop - reply to a file (or send /loop <URL>, even of a YouTube video or live stream) to loop it instead of my video when the playlist is empty, send just /loop to loop nothing, /loop default to loop my video again
+/loop - reply to a file (or send /loop <URL>, even of a YouTube video, playlist or live stream) to loop it instead of my video when the playlist is empty, send just /loop to loop nothing, /loop default to loop my video again
 /adminonly on - as an admin, let only the admins of the group change what I play in its video chat (/adminonly off to let everyone do it again)
 
 The commands apply to our call, or to the video chat of the group they're sent in.
