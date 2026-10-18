@@ -1792,6 +1792,14 @@ namespace Magnaluna {
         }
 
         /**
+         * Whether just the audio will be played, without the video.
+         */
+        public function isAudioOnly(): bool
+        {
+            return $this->video === null;
+        }
+
+        /**
          * Whether just the video will be played, as calls only carry OPUS audio.
          */
         public function isVideoOnly(): bool
@@ -2011,6 +2019,8 @@ namespace {
     use danog\MadelineProto\VoIP\CallState;
     use Magnaluna\YouTube;
     use Magnaluna\YouTubeException;
+    use Magnaluna\YouTubeLiveStream;
+    use Magnaluna\YouTubeMp4Stream;
     use Magnaluna\YouTubeStream;
 
     final class MyEventHandler extends SimpleEventHandler
