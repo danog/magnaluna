@@ -4,6 +4,8 @@ Telegram video webradio based on [MadelineProto](https://github.com/danog/Madeli
 
 Try it on Telegram [@magicalcrazypony](https://t.me/magicalcrazypony)!
 
+https://github.com/user-attachments/assets/92a9ce36-721c-49ff-9f54-274675c810c0
+
 Created by [Daniil Gentili](https://daniil.it).
 
 ## Video chats, livestreams and conference calls
