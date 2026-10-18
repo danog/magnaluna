@@ -1,7 +1,5 @@
 # magnaluna webradio
 
-[![Build Status](https://travis-ci.org/danog/magnaluna.svg?branch=master)](https://travis-ci.org/danog/magnaluna)
-
 Telegram video webradio based on [MadelineProto](https://github.com/danog/MadelineProto), with advanced features like call programming and real-time call stats.
 
 It plays a video in:
