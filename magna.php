@@ -1452,6 +1452,7 @@ namespace Magnaluna {
 
 namespace {
     use Amp\ByteStream\ReadableStream;
+    use danog\DialogId\DialogId;
     use danog\MadelineProto\Broadcast\Progress;
     use danog\MadelineProto\Broadcast\Status;
     use danog\MadelineProto\CallNotAllowedException;
@@ -1563,6 +1564,41 @@ namespace {
         {
             return new LocalFile(self::isRtmp($call) ? self::VIDEO_RTMP : self::VIDEO);
         }
+
+        /**
+         * Whether a user may change what we play in a call.
+         *
+         * What we play in an RTMP livestream replaces its broadcast, so only the admins of its group or channel
+         * (or the owner of its live story) may choose it, as they could themselves.
+         */
+        private function mayControl(Call $call, int $userId): bool
+        {
+            if (!self::isRtmp($call) || in_array($userId, self::ADMINS, true)) {
+                return true;
+            }
+            $peer = $call->peerId ?? null;
+            if ($peer === null) {
+                return false;
+            }
+            if ($peer > 0) {
+                return $peer === $userId;
+            }
+            try {
+                if (DialogId::isSupergroupOrChannel($peer)) {
+                    $participant = $this->channels->getParticipant(channel: $peer, participant: $userId)['participant'];
+                    return in_array($participant['_'], ['channelParticipantCreator', 'channelParticipantAdmin'], true);
+                }
+                foreach ($this->messages->getFullChat(chat_id: $peer)['full_chat']['participants']['participants'] ?? [] as $participant) {
+                    if ($participant['user_id'] === $userId) {
+                        return in_array($participant['_'], ['chatParticipantCreator', 'chatParticipantAdmin'], true);
+                    }
+                }
+            } catch (RPCErrorException) {
+            }
+            return false;
+        }
+
+        private const NOT_LIVESTREAM_ADMIN = "Only the admins of this livestream's group or channel can choose what I play in it.";
 
         /**
          * Get a video chat or conference call we're in, by its ID.
@@ -1695,6 +1731,10 @@ namespace {
                 $message->reply($this->notInCall($message));
                 return;
             }
+            if (!$this->mayControl($call, $message->senderId)) {
+                $message->reply(self::NOT_LIVESTREAM_ADMIN);
+                return;
+            }
             try {
                 $file = $this->getFile($message, self::isRtmp($call));
                 $message->reply($file === null
@@ -1712,6 +1752,10 @@ namespace {
                 $message->reply($this->notInCall($message));
                 return;
             }
+            if (!$this->mayControl($call, $message->senderId)) {
+                $message->reply(self::NOT_LIVESTREAM_ADMIN);
+                return;
+            }
             try {
                 $file = ($message->commandArgs[0] ?? null) === 'default'
                     ? [self::defaultVideo($call), '']
@@ -1727,6 +1771,10 @@ namespace {
         {
             if (!$call = $this->getCallFor($message)) {
                 $message->reply($this->notInCall($message));
+                return;
+            }
+            if (!$this->mayControl($call, $message->senderId)) {
+                $message->reply(self::NOT_LIVESTREAM_ADMIN);
                 return;
             }
             $message->reply($this->skip($call));
@@ -1755,6 +1803,10 @@ namespace {
                 || !preg_match(self::CALL_CHAT_COMMAND, $message->message->text, $matches)
                 || !$call = $this->getMultiCall($message->callId)
             ) {
+                return;
+            }
+            if (!$this->mayControl($call, $message->fromId)) {
+                $call->sendMessage(self::NOT_LIVESTREAM_ADMIN);
                 return;
             }
             if ($matches[1] === 'leave') {
@@ -1788,7 +1840,16 @@ namespace {
         public function joinCommand(Incoming&GroupMessage $message): void
         {
             try {
-                $this->broadcast($message->requestCall()->join());
+                $joined = $this->getGroupCall($message->chatId)?->isJoined() ?? false;
+                $call = $message->requestCall()->join();
+                if (!$this->mayControl($call, $message->senderId)) {
+                    if (!$joined) {
+                        $call->leave();
+                    }
+                    $message->reply(self::NOT_LIVESTREAM_ADMIN);
+                    return;
+                }
+                $this->broadcast($call);
                 $message->reply('Playing in the video chat!');
             } catch (CallNotAllowedException $e) {
                 $message->reply("I can't start a video chat here: {$e->reason->value}");
@@ -1830,6 +1891,14 @@ namespace {
                     $message->reply('Joining the video chat...');
                     $call = $this->joinGroupCall('@'.$matches[1], inviteHash: $matches[2] ?? null);
                 } else {
+                    return;
+                }
+                if (!$this->mayControl($call, $message->senderId)) {
+                    // Stay if someone who may control it linked it too.
+                    if (!in_array($call->id, $this->linkedCalls, true)) {
+                        $call->leave();
+                    }
+                    $message->reply(self::NOT_LIVESTREAM_ADMIN);
                     return;
                 }
                 $this->broadcast($call);
