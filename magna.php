@@ -2038,6 +2038,7 @@ namespace {
     use danog\MadelineProto\EventHandler\SimpleFilter\Running;
     use danog\MadelineProto\Exception;
     use danog\MadelineProto\LocalFile;
+    use danog\MadelineProto\Logger;
     use danog\MadelineProto\MediaDestination;
     use danog\MadelineProto\ParseMode;
     use danog\MadelineProto\RemoteUrl;
@@ -2146,6 +2147,28 @@ namespace {
         private static function defaultVideo(Call $call): LocalFile
         {
             return new LocalFile(self::isRtmp($call) ? self::VIDEO_RTMP : self::VIDEO);
+        }
+
+        /** The errors of messages we may not send in a chat: they're not ours to report. */
+        private const CANT_WRITE = [
+            'CHAT_WRITE_FORBIDDEN', 'CHAT_GUEST_SEND_FORBIDDEN', 'CHAT_SEND_PLAIN_FORBIDDEN', 'CHAT_RESTRICTED',
+            'USER_BANNED_IN_CHANNEL', 'CHANNEL_PRIVATE', 'TOPIC_CLOSED',
+        ];
+
+        /**
+         * Reply to a message, unless we may not write in its chat (a group where we're restricted, a channel's
+         * discussion group we didn't join): the command was carried out anyway.
+         */
+        private function respond(Message $message, mixed ...$args): void
+        {
+            try {
+                $message->reply(...$args);
+            } catch (RPCErrorException $e) {
+                if (!in_array($e->rpc, self::CANT_WRITE, true) && !str_starts_with($e->rpc, 'SLOWMODE_WAIT')) {
+                    throw $e;
+                }
+                $this->logger("Could not reply in {$message->chatId}: {$e->rpc}", Logger::NOTICE);
+            }
         }
 
         /**
@@ -2481,11 +2504,11 @@ namespace {
         {
             $target = $this->getCallFor($message, join: true);
             if (is_string($target)) {
-                $message->reply($target);
+                $this->respond($message, $target);
                 return;
             }
             [$call, $args] = $target;
-            $message->reply($this->playFile($message, $call, $args[0] ?? null, loop: false)
+            $this->respond($message, $this->playFile($message, $call, $args[0] ?? null, loop: false)
                 ?? 'Reply to a video or audio file with /play, or send /play <URL>, to add it to the playlist.');
         }
 
@@ -2494,15 +2517,15 @@ namespace {
         {
             $target = $this->getCallFor($message, join: true);
             if (is_string($target)) {
-                $message->reply($target);
+                $this->respond($message, $target);
                 return;
             }
             [$call, $args] = $target;
             if (($args[0] ?? null) === 'default') {
-                $message->reply($this->setLoop($call, self::defaultVideo($call), ''));
+                $this->respond($message, $this->setLoop($call, self::defaultVideo($call), ''));
                 return;
             }
-            $message->reply($this->playFile($message, $call, $args[0] ?? null, loop: true)
+            $this->respond($message, $this->playFile($message, $call, $args[0] ?? null, loop: true)
                 ?? $this->setLoop($call, null, ''));
         }
 
@@ -2634,7 +2657,7 @@ namespace {
         public function skipCommand(Incoming&Message $message): void
         {
             $target = $this->getCallFor($message);
-            $message->reply(is_string($target) ? $target : $this->skip($target[0]));
+            $this->respond($message, is_string($target) ? $target : $this->skip($target[0]));
         }
 
         private function skip(Call $call): string
@@ -2703,14 +2726,14 @@ namespace {
             try {
                 $target = $where === null ? null : $this->parseTarget($where);
             } catch (InvalidArgumentException $e) {
-                $message->reply($e->getMessage());
+                $this->respond($message, $e->getMessage());
                 return;
             }
             if ($target === null && ($where !== null || !$message instanceof GroupMessage)) {
-                $message->reply('Send /join <username or link of a group or channel, or link of a call> to make me join its video chat, livestream or conference call (or just /join in a group).');
+                $this->respond($message, 'Send /join <username or link of a group or channel, or link of a call> to make me join its video chat, livestream or conference call (or just /join in a group).');
                 return;
             }
-            $message->reply(self::joinedReply($this->joinCall($message, $target, $where), $where));
+            $this->respond($message, self::joinedReply($this->joinCall($message, $target, $where), $where));
         }
 
         /**
@@ -2796,34 +2819,34 @@ namespace {
             try {
                 $target = isset($args[0]) ? $this->parseTarget($args[0]) : null;
             } catch (InvalidArgumentException $e) {
-                $message->reply($e->getMessage());
+                $this->respond($message, $e->getMessage());
                 return;
             }
             $where = $target === null ? 'this group' : array_shift($args);
             $peer = $target === null ? ($message->chatId < 0 ? $message->chatId : null) : $target['peer'];
             $mode = $args[0] ?? null;
             if ($peer === null || !in_array($mode, [null, 'on', 'off'], true)) {
-                $message->reply('Send /adminonly on (or off) in a group, or /adminonly <username, link or ID of a group or channel> on (or off) anywhere, to let only its admins (or everyone again) change what I play in its video chat.');
+                $this->respond($message, 'Send /adminonly on (or off) in a group, or /adminonly <username, link or ID of a group or channel> on (or off) anywhere, to let only its admins (or everyone again) change what I play in its video chat.');
                 return;
             }
             if ($mode === null) {
                 $command = $target === null ? '/adminonly' : "/adminonly $where";
-                $message->reply(isset($this->adminOnly[$peer])
+                $this->respond($message, isset($this->adminOnly[$peer])
                     ? "Only the admins of $where can change what I play in its video chat: an admin can send $command off to let everyone do it."
                     : "Everyone can change what I play in the video chat of $where: an admin can send $command on to keep it to the admins.");
                 return;
             }
             $role = in_array($message->senderId, self::ADMINS, true) ? self::ROLE_CALLS : $this->getRole($peer, $message->senderId);
             if ($role !== self::ROLE_ADMIN && $role !== self::ROLE_CALLS) {
-                $message->reply("Only the admins of $where can change who controls what I play there.");
+                $this->respond($message, "Only the admins of $where can change who controls what I play there.");
                 return;
             }
             if ($mode === 'on') {
                 $this->adminOnly[$peer] = true;
-                $message->reply("Only the admins of $where can change what I play in its video chat now.");
+                $this->respond($message, "Only the admins of $where can change what I play in its video chat now.");
             } else {
                 unset($this->adminOnly[$peer]);
-                $message->reply("Everyone can change what I play in the video chat of $where now.");
+                $this->respond($message, "Everyone can change what I play in the video chat of $where now.");
             }
         }
 
@@ -2835,21 +2858,21 @@ namespace {
         public function leaveCommand(Incoming&Message $message): void
         {
             if ($message->chatId > 0 && !isset($message->commandArgs[0])) {
-                $message->reply('Send /leave <username or link of a group or channel, or link of a call> to make me leave its call.');
+                $this->respond($message, 'Send /leave <username or link of a group or channel, or link of a call> to make me leave its call.');
                 return;
             }
             $target = $this->getCallFor($message);
             if (is_string($target)) {
-                $message->reply($target);
+                $this->respond($message, $target);
                 return;
             }
             $call = $target[0];
             \assert($call instanceof MultiCall);
             try {
                 $call->leave();
-                $message->reply('Left the call!');
+                $this->respond($message, 'Left the call!');
             } catch (Throwable $e) {
-                $message->reply("Could not leave the call: {$e->getMessage()}");
+                $this->respond($message, "Could not leave the call: {$e->getMessage()}");
             }
         }
 
@@ -2865,14 +2888,14 @@ namespace {
             ) {
                 return;
             }
-            $message->reply('Joining the call...');
+            $this->respond($message, 'Joining the call...');
             try {
                 $target = $this->parseTarget($matches[0]);
             } catch (InvalidArgumentException $e) {
-                $message->reply($e->getMessage());
+                $this->respond($message, $e->getMessage());
                 return;
             }
-            $message->reply(self::joinedReply($this->joinCall($message, $target, $matches[0]), $matches[0]));
+            $this->respond($message, self::joinedReply($this->joinCall($message, $target, $matches[0]), $matches[0]));
         }
 
         private int $lastLog = 0;
@@ -2899,7 +2922,7 @@ namespace {
         {
             // We can broadcast messages to all users with /broadcast
             if (!$message->replyToMsgId) {
-                $message->reply("You should reply to the message you want to broadcast.");
+                $this->respond($message, "You should reply to the message you want to broadcast.");
                 return;
             }
             $this->broadcastForwardMessages(
@@ -2915,7 +2938,7 @@ namespace {
         {
             // We can broadcast messages to all users with /broadcast
             if (!$message->replyToMsgId) {
-                $message->reply("You should reply to the message you want to broadcast.");
+                $this->respond($message, "You should reply to the message you want to broadcast.");
                 return;
             }
             $this->broadcastForwardMessages(
@@ -2995,7 +3018,7 @@ namespace {
                 if (!isset($this->my_users[$message->chatId]) || $message->message === '/start') {
                     $runCall = true;
                     $this->my_users[$message->chatId] = true;
-                    $message->reply(
+                    $this->respond($message, 
                         message: "Hi, I'm {$this->me} the video webradio.
 
 Call _me_ to watch an **awesome** video, or send /call to make _me_ call _you_ (don't forget to disable call privacy settings!).
@@ -3048,11 +3071,11 @@ Source code: https://github.com/danog/MadelineProto
                 if (str_starts_with($message->message, '/program') && $message->chatId > 0) {
                     $time = strtotime(str_replace('/program ', '', $message->message));
                     if ($time === false) {
-                        $message->reply('Invalid time provided');
+                        $this->respond($message, 'Invalid time provided');
                     } elseif ($time - time() <= 0) {
-                        $message->reply('Invalid time provided');
+                        $this->respond($message, 'Invalid time provided');
                     } else {
-                        $message->reply('OK');
+                        $this->respond($message, 'OK');
                         $this->programmed_call[] = [$message->chatId, $time];
                         $key = count($this->programmed_call) - 1;
                         Tools::sleep($time - time());
@@ -3068,7 +3091,7 @@ Source code: https://github.com/danog/MadelineProto
                         $t = str_replace('FLOOD_WAIT_', '', $e->rpc);
                         $e = "Too many people used the /call function. I'll be able to call you in $t seconds.\nYou can also call me right now";
                     }
-                    $message->reply((string) $e);
+                    $this->respond($message, (string) $e);
                 } catch (RPCErrorException $e) {
                 }
                 $this->logger($e);
