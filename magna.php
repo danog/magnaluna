@@ -25,6 +25,7 @@ namespace Magnaluna {
     use Amp\Http\Client\HttpClientBuilder;
     use Amp\Http\Client\Request;
     use Closure;
+    use danog\MadelineProto\Mp4;
     use danog\MadelineProto\ResumableStream;
     use Generator;
     use IteratorAggregate;
@@ -45,6 +46,11 @@ namespace Magnaluna {
     // The video played in every call: a WebM file, sent as-is (no ffmpeg needed).
     if (!file_exists('oncall.webm')) {
         copy('https://paste.daniil.it/oncall.webm', 'oncall.webm');
+    }
+    // The same video for RTMP livestreams, which only carry H.264 and AAC (padded to 16:9, as Telegram
+    // stretches every livestream to 1280x720).
+    if (!file_exists('oncall.mp4')) {
+        copy('https://paste.daniil.it/oncall.mp4', 'oncall.mp4');
     }
 
     /**
@@ -565,6 +571,43 @@ namespace Magnaluna {
         }
 
         /**
+         * The best MP4 H.264 video format no higher than the given height, if any (for RTMP livestreams).
+         */
+        public static function pickH264Video(array $player, int $maxHeight): ?array
+        {
+            $formats = array_filter(
+                self::getFormats($player),
+                static fn (array $format): bool => str_starts_with($format['mimeType'], 'video/mp4; codecs="avc1.')
+                    && ($format['height'] ?? PHP_INT_MAX) <= $maxHeight,
+            );
+            usort($formats, static fn (array $a, array $b): int => [$b['height'] ?? 0, $b['fps'] ?? 0, $b['bitrate'] ?? 0]
+                <=> [$a['height'] ?? 0, $a['fps'] ?? 0, $a['bitrate'] ?? 0]);
+            return $formats[0] ?? null;
+        }
+
+        /**
+         * The best MP4 AAC audio format, in the original language, if any (for RTMP livestreams): AAC-LC first.
+         */
+        public static function pickAacAudio(array $player): ?array
+        {
+            $formats = array_filter(
+                self::getFormats($player),
+                static fn (array $format): bool => str_starts_with($format['mimeType'], 'audio/mp4; codecs="mp4a.')
+                    && !($format['isDrc'] ?? false),
+            );
+            usort($formats, static fn (array $a, array $b): int => [
+                $b['audioTrack']['audioIsDefault'] ?? true,
+                $b['mimeType'] === 'audio/mp4; codecs="mp4a.40.2"',
+                $b['bitrate'] ?? 0,
+            ] <=> [
+                $a['audioTrack']['audioIsDefault'] ?? true,
+                $a['mimeType'] === 'audio/mp4; codecs="mp4a.40.2"',
+                $a['bitrate'] ?? 0,
+            ]);
+            return $formats[0] ?? null;
+        }
+
+        /**
          * Find a format again, by its itag and size.
          */
         public static function findFormat(array $player, int $itag, int $size): ?array
@@ -596,6 +639,90 @@ namespace Magnaluna {
     }
 
     /**
+     * Fetching the formats of a YouTube video a range at a time, with new URLs when they expire.
+     *
+     * Needs the videoId, video and audio (the formats: itag and size) properties, the urls and client ones, and the
+     * cancellation of the current read.
+     */
+    trait FetchesYouTubeFormats
+    {
+        /** How many times to try fetching a range. */
+        private const ATTEMPTS = 5;
+
+        /**
+         * Fetch a range of the video or audio file, getting new URLs if needed.
+         *
+         * @param 'video'|'audio' $kind
+         */
+        private function fetch(string $kind, int $start, int $end): string
+        {
+            $errors = [];
+            for ($attempt = 1; ; $attempt++) {
+                try {
+                    $this->urls ??= $this->getUrls();
+                    $request = new Request($this->urls[$kind]);
+                    $request->setHeader('Range', "bytes=$start-$end");
+                    $request->setHeader('User-Agent', $this->urls['userAgent']);
+                    $request->setTransferTimeout(120);
+                    $request->setInactivityTimeout(30);
+                    $response = YouTube::getClient()->request($request, $this->cancellation);
+                    $body = $response->getBody()->buffer($this->cancellation);
+                    $status = $response->getStatus();
+                    if ($status === 206 && \strlen($body) === $end - $start + 1) {
+                        return $body;
+                    }
+                    if ($status === 403 || $status === 410) {
+                        // The URLs expired, were requested from another IP address (they're bound to
+                        // it), or are refused (sometimes for no reason): get new ones, from the next
+                        // client if they're refused again.
+                        $this->urls = null;
+                        if ($attempt % 2 === 0) {
+                            $this->client++;
+                        }
+                    }
+                    throw new YouTubeException("HTTP status $status, got ".\strlen($body).' bytes');
+                } catch (CancelledException $e) {
+                    throw $e;
+                } catch (Throwable $e) {
+                    $errors[] = $e->getMessage();
+                    if ($attempt >= self::ATTEMPTS) {
+                        throw new YouTubeException("Could not fetch the $kind of $this->videoId: ".implode('; ', array_unique($errors)), 0, $e);
+                    }
+                    delay($attempt, cancellation: $this->cancellation);
+                }
+            }
+        }
+
+        /**
+         * Get new URLs for the formats, from the first client (starting from the current one) that has them.
+         *
+         * @return array{video?: string, audio: string, userAgent: string}
+         */
+        private function getUrls(): array
+        {
+            $missing = null;
+            for ($i = 0; $i < YouTube::getClientCount(); $i++) {
+                [$player, $userAgent, $client] = YouTube::getPlayer($this->videoId, $this->cancellation, $this->client + $i);
+                $urls = ['userAgent' => $userAgent];
+                foreach (['video' => $this->video, 'audio' => $this->audio] as $kind => $format) {
+                    if ($format === null) {
+                        continue;
+                    }
+                    $found = YouTube::findFormat($player, $format['itag'], $format['size']);
+                    if ($found === null) {
+                        $missing = $kind;
+                        continue 2;
+                    }
+                    $urls[$kind] = $found['url'];
+                }
+                $this->client = $client;
+                return $urls;
+            }
+            throw new YouTubeException("The $missing of $this->videoId isn't available anymore");
+        }
+    }
+
+    /**
      * A YouTube video, as a WebM file with VP9 video and OPUS audio, that can be played in calls as it is.
      *
      * YouTube serves the video and the audio of a video as separate WebM files: they are fetched a
@@ -610,6 +737,7 @@ namespace Magnaluna {
     {
         use ReadableStreamIteratorAggregate;
         use ForbidCloning;
+        use FetchesYouTubeFormats;
 
         private const ID_EBML = 0x1A45DFA3;
         private const ID_EBML_VERSION = 0x4286;
@@ -636,9 +764,6 @@ namespace Magnaluna {
         private const AUDIO_TRACK = 2;
         /** The longest cluster, in milliseconds: a new one is also started at every video keyframe. */
         private const MAX_CLUSTER_LENGTH = 10_000;
-        /** How many times to try fetching a range. */
-        private const ATTEMPTS = 5;
-
         /** @var array{video?: WebmReader, audio?: WebmReader} */
         private array $readers = [];
         /**
@@ -856,78 +981,6 @@ namespace Magnaluna {
             return $this->readers[$kind];
         }
 
-        /**
-         * Fetch a range of the video or audio file, getting new URLs if needed.
-         *
-         * @param 'video'|'audio' $kind
-         */
-        private function fetch(string $kind, int $start, int $end): string
-        {
-            $errors = [];
-            for ($attempt = 1; ; $attempt++) {
-                try {
-                    $this->urls ??= $this->getUrls();
-                    $request = new Request($this->urls[$kind]);
-                    $request->setHeader('Range', "bytes=$start-$end");
-                    $request->setHeader('User-Agent', $this->urls['userAgent']);
-                    $request->setTransferTimeout(120);
-                    $request->setInactivityTimeout(30);
-                    $response = YouTube::getClient()->request($request, $this->cancellation);
-                    $body = $response->getBody()->buffer($this->cancellation);
-                    $status = $response->getStatus();
-                    if ($status === 206 && \strlen($body) === $end - $start + 1) {
-                        return $body;
-                    }
-                    if ($status === 403 || $status === 410) {
-                        // The URLs expired, were requested from another IP address (they're bound to
-                        // it), or are refused (sometimes for no reason): get new ones, from the next
-                        // client if they're refused again.
-                        $this->urls = null;
-                        if ($attempt % 2 === 0) {
-                            $this->client++;
-                        }
-                    }
-                    throw new YouTubeException("HTTP status $status, got ".\strlen($body).' bytes');
-                } catch (CancelledException $e) {
-                    throw $e;
-                } catch (Throwable $e) {
-                    $errors[] = $e->getMessage();
-                    if ($attempt >= self::ATTEMPTS) {
-                        throw new YouTubeException("Could not fetch the $kind of $this->videoId: ".implode('; ', array_unique($errors)), 0, $e);
-                    }
-                    delay($attempt, cancellation: $this->cancellation);
-                }
-            }
-        }
-
-        /**
-         * Get new URLs for the formats, from the first client (starting from the current one) that has them.
-         *
-         * @return array{video?: string, audio: string, userAgent: string}
-         */
-        private function getUrls(): array
-        {
-            $missing = null;
-            for ($i = 0; $i < YouTube::getClientCount(); $i++) {
-                [$player, $userAgent, $client] = YouTube::getPlayer($this->videoId, $this->cancellation, $this->client + $i);
-                $urls = ['userAgent' => $userAgent];
-                foreach (['video' => $this->video, 'audio' => $this->audio] as $kind => $format) {
-                    if ($format === null) {
-                        continue;
-                    }
-                    $found = YouTube::findFormat($player, $format['itag'], $format['size']);
-                    if ($found === null) {
-                        $missing = $kind;
-                        continue 2;
-                    }
-                    $urls[$kind] = $found['url'];
-                }
-                $this->client = $client;
-                return $urls;
-            }
-            throw new YouTubeException("The $missing of $this->videoId isn't available anymore");
-        }
-
         /** @psalm-mutation-free */
         #[\Override]
         public function isReadable(): bool
@@ -989,6 +1042,412 @@ namespace Magnaluna {
             $this->onClose = new DeferredFuture;
         }
     }
+
+    /**
+     * A file read a range at a time, from start to end.
+     *
+     * @implements IteratorAggregate<int, string>
+     */
+    final class RangeStream implements ReadableStream, IteratorAggregate
+    {
+        use ReadableStreamIteratorAggregate;
+        use ForbidCloning;
+
+        /** The size of the ranges. */
+        private const CHUNK = 1 << 20;
+
+        private int $offset = 0;
+        private bool $closed = false;
+        private DeferredFuture $onClose;
+
+        /**
+         * @param Closure(int, int): string $fetch Fetch a range of the file (first and last byte, included).
+         */
+        public function __construct(private readonly Closure $fetch, private readonly int $size)
+        {
+            $this->onClose = new DeferredFuture;
+        }
+
+        #[\Override]
+        public function read(?Cancellation $cancellation = null): ?string
+        {
+            if ($this->closed || $this->offset >= $this->size) {
+                return null;
+            }
+            $end = min($this->offset + self::CHUNK, $this->size) - 1;
+            $chunk = ($this->fetch)($this->offset, $end);
+            $this->offset = $end + 1;
+            return $chunk;
+        }
+
+        /** @psalm-mutation-free */
+        #[\Override]
+        public function isReadable(): bool
+        {
+            return !$this->closed && $this->offset < $this->size;
+        }
+
+        #[\Override]
+        public function close(): void
+        {
+            $this->closed = true;
+            if (!$this->onClose->isComplete()) {
+                $this->onClose->complete();
+            }
+        }
+
+        /** @psalm-mutation-free */
+        #[\Override]
+        public function isClosed(): bool
+        {
+            return !$this->isReadable();
+        }
+
+        #[\Override]
+        public function onClose(Closure $onClose): void
+        {
+            $this->onClose->getFuture()->finally($onClose);
+        }
+    }
+
+    /**
+     * A YouTube video for RTMP livestreams, which only carry H.264 and AAC: a Matroska file with the H.264 video
+     * and the AAC audio of the video, which YouTube serves as separate fragmented MP4 files.
+     *
+     * The frames of both files are demuxed (with MadelineProto's MP4 demuxer) as they're fetched, a range at a time,
+     * and muxed into a single file on the fly, without ffmpeg.
+     *
+     * The stream is resumable: once unserialized, it continues after the last chunk that was read (the files are
+     * read again from their start up to there, with new URLs).
+     *
+     * @implements IteratorAggregate<int, string>
+     */
+    final class YouTubeMp4Stream implements ReadableStream, ResumableStream, IteratorAggregate
+    {
+        use ReadableStreamIteratorAggregate;
+        use ForbidCloning;
+        use FetchesYouTubeFormats;
+
+        private const ID_EBML = 0x1A45DFA3;
+        private const ID_EBML_VERSION = 0x4286;
+        private const ID_EBML_READ_VERSION = 0x42F7;
+        private const ID_EBML_MAX_ID_LENGTH = 0x42F2;
+        private const ID_EBML_MAX_SIZE_LENGTH = 0x42F3;
+        private const ID_DOC_TYPE = 0x4282;
+        private const ID_DOC_TYPE_VERSION = 0x4287;
+        private const ID_DOC_TYPE_READ_VERSION = 0x4285;
+        private const ID_SEGMENT = 0x18538067;
+        private const ID_INFO = 0x1549A966;
+        private const ID_TIMESTAMP_SCALE = 0x2AD7B1;
+        private const ID_MUXING_APP = 0x4D80;
+        private const ID_WRITING_APP = 0x5741;
+        private const ID_TITLE = 0x7BA9;
+        private const ID_TRACKS = 0x1654AE6B;
+        private const ID_TRACK_ENTRY = 0xAE;
+        private const ID_TRACK_NUMBER = 0xD7;
+        private const ID_TRACK_UID = 0x73C5;
+        private const ID_TRACK_TYPE = 0x83;
+        private const ID_CODEC_ID = 0x86;
+        private const ID_CODEC_PRIVATE = 0x63A2;
+        private const ID_VIDEO = 0xE0;
+        private const ID_PIXEL_WIDTH = 0xB0;
+        private const ID_PIXEL_HEIGHT = 0xBA;
+        private const ID_AUDIO = 0xE1;
+        private const ID_SAMPLING_FREQUENCY = 0xB5;
+        private const ID_CHANNELS = 0x9F;
+        private const ID_CLUSTER = 0x1F43B675;
+        private const ID_TIMESTAMP = 0xE7;
+        private const ID_SIMPLE_BLOCK = 0xA3;
+
+        private const VIDEO_TRACK = 1;
+        private const AUDIO_TRACK = 2;
+        private const TRACK_TYPES = ['video' => 1, 'audio' => 2];
+        /** The longest cluster, in milliseconds: a new one is also started at every video keyframe. */
+        private const MAX_CLUSTER_LENGTH = 10_000;
+
+        /** @var array{video?: Mp4, audio?: Mp4} */
+        private array $demuxers = [];
+        /** @var array{video?: \Iterator, audio?: \Iterator} The frames of the demuxers. */
+        private array $frames = [];
+        /**
+         * The timestamp of the last frame read (in milliseconds), so that a resumed stream continues after it.
+         */
+        private int $readUntil = -1;
+        /**
+         * The URLs of the formats (which expire), and the user agent to fetch them with.
+         *
+         * @var array{video?: string, audio: string, userAgent: string}|null
+         */
+        private ?array $urls = null;
+        /** The InnerTube client to get the URLs with, see {@see YouTube::getPlayer()}. */
+        private int $client = 0;
+        private ?Cancellation $cancellation = null;
+        private bool $headerRead = false;
+        private bool $eof = false;
+        private bool $closed = false;
+        private DeferredFuture $onClose;
+
+        /**
+         * @param array{itag: int, size: int}|null $video The video format, if any.
+         * @param array{itag: int, size: int}      $audio The audio format.
+         */
+        private function __construct(
+            public readonly string $videoId,
+            public readonly string $title,
+            private readonly ?array $video,
+            private readonly array $audio,
+        ) {
+            $this->onClose = new DeferredFuture;
+        }
+
+        /**
+         * Open a YouTube video.
+         *
+         * @param string $videoId   The ID of the video, see {@see YouTube::parseLink()}.
+         * @param int    $maxHeight The highest resolution to play: Telegram shows livestreams in 720p.
+         *
+         * @throws YouTubeException If it can't be played.
+         */
+        public static function open(string $videoId, int $maxHeight = 720, ?Cancellation $cancellation = null): self
+        {
+            [$player, $userAgent, $client] = YouTube::getPlayer($videoId, $cancellation);
+            if ($player['videoDetails']['isLive'] ?? false) {
+                throw new YouTubeException("Live streams can't be played");
+            }
+            $video = YouTube::pickH264Video($player, $maxHeight);
+            $audio = YouTube::pickAacAudio($player)
+                ?? throw new YouTubeException('This video has no AAC audio');
+            $stream = new self(
+                $videoId,
+                $player['videoDetails']['title'] ?? $videoId,
+                $video === null ? null : ['itag' => $video['itag'], 'size' => $video['size']],
+                ['itag' => $audio['itag'], 'size' => $audio['size']],
+            );
+            $stream->client = $client;
+            $stream->urls = ['audio' => $audio['url'], 'userAgent' => $userAgent];
+            if ($video !== null) {
+                $stream->urls['video'] = $video['url'];
+            }
+            return $stream;
+        }
+
+        /**
+         * Whether just the audio will be played, as there's no MP4 H.264 video.
+         */
+        public function isAudioOnly(): bool
+        {
+            return $this->video === null;
+        }
+
+        #[\Override]
+        public function read(?Cancellation $cancellation = null): ?string
+        {
+            if ($this->closed || $this->eof) {
+                return null;
+            }
+            $this->cancellation = $cancellation;
+            try {
+                $this->startDemuxing();
+                if (!$this->headerRead) {
+                    $this->headerRead = true;
+                    return $this->header();
+                }
+                $cluster = $this->readCluster();
+            } finally {
+                $this->cancellation = null;
+            }
+            if ($cluster === null) {
+                $this->eof = true;
+                $this->demuxers = $this->frames = [];
+            }
+            return $cluster;
+        }
+
+        /**
+         * Start demuxing the formats (again, after resuming: from their start, skipping the frames already read).
+         */
+        private function startDemuxing(): void
+        {
+            if ($this->frames !== []) {
+                return;
+            }
+            foreach (['video' => $this->video, 'audio' => $this->audio] as $kind => $format) {
+                if ($format === null) {
+                    continue;
+                }
+                $demuxer = new Mp4(
+                    new RangeStream(fn (int $start, int $end): string => $this->fetch($kind, $start, $end), $format['size']),
+                    $this->cancellation,
+                );
+                $expected = $kind === 'video' ? 'V_MPEG4/ISO/AVC' : 'A_AAC';
+                if (!$demuxer->hasCodec($expected)) {
+                    throw new YouTubeException("Unexpected $kind file: no $expected track");
+                }
+                $this->demuxers[$kind] = $demuxer;
+                $frames = (static function () use ($demuxer, $expected): Generator {
+                    foreach ($demuxer->frames as $frame) {
+                        if ($frame['codec'] === $expected) {
+                            yield $frame;
+                        }
+                    }
+                })();
+                $this->frames[$kind] = $frames;
+                if ($this->readUntil >= 0) {
+                    // Resuming: the decoder of the video needs to start from a keyframe.
+                    while ($frames->valid() && ($frames->current()['timestamp'] <= $this->readUntil
+                        || ($kind === 'video' && !$frames->current()['keyframe']))
+                    ) {
+                        $frames->next();
+                    }
+                }
+            }
+        }
+
+        /**
+         * The EBML header, the info and the tracks of the file.
+         */
+        private function header(): string
+        {
+            $tracks = '';
+            foreach (['video' => self::VIDEO_TRACK, 'audio' => self::AUDIO_TRACK] as $kind => $number) {
+                if (!isset($this->demuxers[$kind])) {
+                    continue;
+                }
+                $expected = $kind === 'video' ? 'V_MPEG4/ISO/AVC' : 'A_AAC';
+                foreach ($this->demuxers[$kind]->tracks as $track) {
+                    if ($track['codec'] !== $expected) {
+                        continue;
+                    }
+                    $elements = Ebml::uint(self::ID_TRACK_NUMBER, $number)
+                        .Ebml::uint(self::ID_TRACK_UID, $number)
+                        .Ebml::uint(self::ID_TRACK_TYPE, self::TRACK_TYPES[$kind])
+                        .Ebml::element(self::ID_CODEC_ID, $track['codec'])
+                        .($track['private'] === null ? '' : Ebml::element(self::ID_CODEC_PRIVATE, $track['private']));
+                    $elements .= $kind === 'video'
+                        ? Ebml::element(self::ID_VIDEO, Ebml::uint(self::ID_PIXEL_WIDTH, $track['width']).Ebml::uint(self::ID_PIXEL_HEIGHT, $track['height']))
+                        : Ebml::element(self::ID_AUDIO, Ebml::element(self::ID_SAMPLING_FREQUENCY, pack('E', (float) $track['rate'])).Ebml::uint(self::ID_CHANNELS, $track['channels']));
+                    $tracks .= Ebml::element(self::ID_TRACK_ENTRY, $elements);
+                    break;
+                }
+            }
+            return Ebml::element(
+                self::ID_EBML,
+                Ebml::uint(self::ID_EBML_VERSION, 1)
+                .Ebml::uint(self::ID_EBML_READ_VERSION, 1)
+                .Ebml::uint(self::ID_EBML_MAX_ID_LENGTH, 4)
+                .Ebml::uint(self::ID_EBML_MAX_SIZE_LENGTH, 8)
+                .Ebml::element(self::ID_DOC_TYPE, 'matroska')
+                .Ebml::uint(self::ID_DOC_TYPE_VERSION, 4)
+                .Ebml::uint(self::ID_DOC_TYPE_READ_VERSION, 2),
+            )
+            // A segment of unknown size, as the file is streamed.
+            .pack('N', self::ID_SEGMENT)."\x01\xFF\xFF\xFF\xFF\xFF\xFF\xFF"
+            .Ebml::element(
+                self::ID_INFO,
+                // Timestamps are in milliseconds.
+                Ebml::uint(self::ID_TIMESTAMP_SCALE, 1_000_000)
+                .Ebml::element(self::ID_MUXING_APP, 'magnaluna')
+                .Ebml::element(self::ID_WRITING_APP, 'magnaluna')
+                .Ebml::element(self::ID_TITLE, $this->title),
+            )
+            .Ebml::element(self::ID_TRACKS, $tracks);
+        }
+
+        /**
+         * Read the next cluster: the frames of the video and audio files, in timestamp order, up to the next video keyframe.
+         */
+        private function readCluster(): ?string
+        {
+            $video = $this->frames['video'] ?? null;
+            $audio = $this->frames['audio'];
+            $clusterTimestamp = null;
+            $blocks = '';
+            while (true) {
+                $videoFrame = $video?->valid() ? $video->current() : null;
+                $audioFrame = $audio->valid() ? $audio->current() : null;
+                if ($videoFrame === null && $audioFrame === null) {
+                    break;
+                }
+                $isVideo = $videoFrame !== null && ($audioFrame === null || $videoFrame['timestamp'] <= $audioFrame['timestamp']);
+                $frame = $isVideo ? $videoFrame : $audioFrame;
+                if ($clusterTimestamp === null) {
+                    $clusterTimestamp = $frame['timestamp'];
+                } elseif (($isVideo && $frame['keyframe']) || $frame['timestamp'] - $clusterTimestamp > self::MAX_CLUSTER_LENGTH) {
+                    break;
+                }
+                $blocks .= Ebml::element(
+                    self::ID_SIMPLE_BLOCK,
+                    \chr(0x80 | ($isVideo ? self::VIDEO_TRACK : self::AUDIO_TRACK))
+                    .pack('n', ($frame['timestamp'] - $clusterTimestamp) & 0xFFFF)
+                    .\chr($frame['keyframe'] || !$isVideo ? 0x80 : 0)
+                    .$frame['data'],
+                );
+                $this->readUntil = max($this->readUntil, $frame['timestamp']);
+                ($isVideo ? $video : $audio)->next();
+            }
+            if ($clusterTimestamp === null) {
+                return null;
+            }
+            return Ebml::element(self::ID_CLUSTER, Ebml::uint(self::ID_TIMESTAMP, $clusterTimestamp).$blocks);
+        }
+
+        /** @psalm-mutation-free */
+        #[\Override]
+        public function isReadable(): bool
+        {
+            return !$this->closed && !$this->eof;
+        }
+
+        #[\Override]
+        public function close(): void
+        {
+            $this->closed = true;
+            $this->demuxers = $this->frames = [];
+            if (!$this->onClose->isComplete()) {
+                $this->onClose->complete();
+            }
+        }
+
+        /** @psalm-mutation-free */
+        #[\Override]
+        public function isClosed(): bool
+        {
+            return !$this->isReadable();
+        }
+
+        #[\Override]
+        public function onClose(Closure $onClose): void
+        {
+            $this->onClose->getFuture()->finally($onClose);
+        }
+
+        public function __serialize(): array
+        {
+            return [
+                'videoId' => $this->videoId,
+                'title' => $this->title,
+                'video' => $this->video,
+                'audio' => $this->audio,
+                'readUntil' => $this->readUntil,
+                'client' => $this->client,
+                'headerRead' => $this->headerRead,
+                'eof' => $this->eof,
+            ];
+        }
+
+        public function __unserialize(array $data): void
+        {
+            $this->videoId = $data['videoId'];
+            $this->title = $data['title'];
+            $this->video = $data['video'];
+            $this->audio = $data['audio'];
+            $this->readUntil = $data['readUntil'];
+            $this->client = $data['client'];
+            $this->headerRead = $data['headerRead'];
+            $this->eof = $data['eof'];
+            $this->onClose = new DeferredFuture;
+        }
+    }
 }
 
 namespace {
@@ -1031,6 +1490,8 @@ namespace {
         public const ADMINS = [101_374_607]; // @danogentili, creator of MadelineProto
         /** The video played in every call. */
         private const VIDEO = 'oncall.webm';
+        /** The video played in RTMP livestreams, which only carry H.264 and AAC. */
+        private const VIDEO_RTMP = 'oncall.mp4';
         /** Conference call links: https://t.me/call/<slug>. */
         private const CONFERENCE_LINK = '~(?:https?://)?(?:t|telegram)\.me/call/([\w-]+)~i';
         /** Video chat and livestream links: https://t.me/<username>?videochat (or ?livestream, ?voicechat), with an optional invite hash. */
@@ -1071,10 +1532,36 @@ namespace {
 
         /**
          * Play the video in a call, on loop.
+         *
+         * In an RTMP livestream, what is played is published to it, which only its admins can do.
          */
         private function broadcast(Call $call): void
         {
-            $call->playOnHold(MediaDestination::Camera, new LocalFile(self::VIDEO));
+            try {
+                $call->playOnHold(MediaDestination::Camera, self::defaultVideo($call));
+            } catch (Throwable $e) {
+                if (self::isRtmp($call)) {
+                    // Don't stay in a livestream we can't publish to, only watching it.
+                    $call->leave();
+                }
+                throw $e;
+            }
+        }
+
+        /**
+         * Whether a call is an RTMP livestream, which only carries H.264 video and AAC audio.
+         */
+        private static function isRtmp(Call $call): bool
+        {
+            return $call instanceof MultiCall && $call->isRtmpMode();
+        }
+
+        /**
+         * The video looped in a call by default.
+         */
+        private static function defaultVideo(Call $call): LocalFile
+        {
+            return new LocalFile(self::isRtmp($call) ? self::VIDEO_RTMP : self::VIDEO);
         }
 
         /**
@@ -1106,13 +1593,15 @@ namespace {
         /**
          * Parse the URL of a file to play (or of a YouTube video), along with a note on how it will be played.
          *
-         * @return array{RemoteUrl|YouTubeStream, string}
+         * @param bool $rtmp Whether it's played in an RTMP livestream, which only carries H.264 video and AAC audio.
+         *
+         * @return array{RemoteUrl|YouTubeStream|YouTubeMp4Stream, string}
          */
-        private static function parseUrl(string $url): array
+        private static function parseUrl(string $url, bool $rtmp): array
         {
             if ($videoId = YouTube::parseLink($url)) {
                 try {
-                    $video = YouTubeStream::open($videoId);
+                    $video = $rtmp ? YouTubeMp4Stream::open($videoId) : YouTubeStream::open($videoId);
                 } catch (YouTubeException $e) {
                     throw new InvalidArgumentException("I can't play this YouTube video: {$e->getMessage()}");
                 }
@@ -1123,16 +1612,23 @@ namespace {
             ) {
                 throw new InvalidArgumentException("$url is not a valid http(s) URL!");
             }
-            return [new RemoteUrl($url), ''];
+            return [new RemoteUrl($url), $rtmp ? ' (in a livestream, it must be an MP4 or MKV file with H.264 video and AAC audio)' : ''];
         }
 
         /**
          * How a Telegram file will be played: '' if entirely, a note if only partially.
          */
-        private static function describeMedia(Media $media): string
+        private static function describeMedia(Media $media, bool $rtmp): string
         {
             $mime = $media->mimeType;
             $ext = strtolower($media->fileExt);
+            if ($rtmp) {
+                // Only H.264 and AAC can be published, as they are.
+                if (in_array($mime, ['video/mp4', 'video/x-matroska', 'audio/mp4'], true) || in_array($ext, ['.mp4', '.mkv', '.m4a'], true)) {
+                    return ' (in a livestream, it must have H.264 video and AAC audio)';
+                }
+                throw new InvalidArgumentException("I can't play this file in a livestream: send me an MP4 or MKV video with H.264 video and AAC audio.");
+            }
             if (in_array($mime, ['video/webm', 'video/x-matroska', 'audio/webm', 'audio/ogg', 'audio/opus'], true)
                 || in_array($ext, ['.webm', '.mkv', '.ogg', '.opus'], true)
             ) {
@@ -1153,10 +1649,10 @@ namespace {
          *
          * @return array{RemoteUrl|ReadableStream, string}|null
          */
-        private function getFile(Message $message): ?array
+        private function getFile(Message $message, bool $rtmp): ?array
         {
             if (isset($message->commandArgs[0])) {
-                return self::parseUrl($message->commandArgs[0]);
+                return self::parseUrl($message->commandArgs[0], $rtmp);
             }
             $media = $message->media;
             if ($media === null && $message->replyToMsgId !== null) {
@@ -1166,7 +1662,7 @@ namespace {
             if ($media === null) {
                 return null;
             }
-            $note = self::describeMedia($media);
+            $note = self::describeMedia($media, $rtmp);
             return [$media->getStream(), $note];
         }
 
@@ -1200,7 +1696,7 @@ namespace {
                 return;
             }
             try {
-                $file = $this->getFile($message);
+                $file = $this->getFile($message, self::isRtmp($call));
                 $message->reply($file === null
                     ? 'Reply to a video or audio file with /play, or send /play <URL>, to add it to the playlist.'
                     : $this->enqueue($call, ...$file));
@@ -1218,8 +1714,8 @@ namespace {
             }
             try {
                 $file = ($message->commandArgs[0] ?? null) === 'default'
-                    ? [new LocalFile(self::VIDEO), '']
-                    : $this->getFile($message);
+                    ? [self::defaultVideo($call), '']
+                    : $this->getFile($message, self::isRtmp($call));
                 $message->reply($this->setLoop($call, $file[0] ?? null, $file[1] ?? ''));
             } catch (InvalidArgumentException $e) {
                 $message->reply($e->getMessage());
@@ -1271,11 +1767,11 @@ namespace {
                 $reply = match ($matches[1]) {
                     'play' => $arg === null
                         ? 'Send /play <URL> to add a file to the playlist.'
-                        : $this->enqueue($call, ...self::parseUrl($arg)),
+                        : $this->enqueue($call, ...self::parseUrl($arg, self::isRtmp($call))),
                     'loop' => $this->setLoop($call, ...match ($arg) {
                         null => [null, ''],
-                        'default' => [new LocalFile(self::VIDEO), ''],
-                        default => self::parseUrl($arg),
+                        'default' => [self::defaultVideo($call), ''],
+                        default => self::parseUrl($arg, self::isRtmp($call)),
                     }),
                     'skip' => $this->skip($call),
                 };
@@ -1471,7 +1967,7 @@ namespace {
 
 Call _me_ to watch an **awesome** video, or send /call to make _me_ call _you_ (don't forget to disable call privacy settings!).
 
-Send me the link of a video chat or a conference call, and I'll join it too!
+Send me the link of a video chat, livestream or conference call, and I'll join it too (I can play in livestreams only if I'm an admin of their group or channel)!
 Add me to your group and send /join to make me join its video chat.
 
 Commands:
