@@ -2061,6 +2061,8 @@ namespace {
         private array $calls = [];
         /** @var array<int, int> */
         private array $messageIds = [];
+        /** @var array<int, string> The text of the status messages of the calls, by user. */
+        private array $statusTexts = [];
         /**
          * The groups and channels whose video chats only their admins may control, see adminOnlyCommand().
          *
@@ -2761,17 +2763,26 @@ namespace {
         {
             foreach ($this->calls as $user => $call) {
                 if ($call->getCallState() === CallState::ENDED) {
-                    unset($this->calls[$call->otherID], $this->messageIds[$call->otherID]);
+                    unset($this->calls[$call->otherID], $this->messageIds[$call->otherID], $this->statusTexts[$call->otherID]);
 
                     continue;
                 }
+                $message = 'Total running calls: '.count($this->calls).PHP_EOL.PHP_EOL;
+                $message .= "Emojis: ".implode('', $call->getVisualization() ?? []);
+                // Telegram refuses edits that don't change the message.
+                if (($this->statusTexts[$call->otherID] ?? null) === $message) {
+                    continue;
+                }
                 try {
-                    $message = 'Total running calls: '.count($this->calls).PHP_EOL.PHP_EOL;
-                    $message .= "Emojis: ".implode('', $call->getVisualization() ?? []);
-
                     $this->messages->editMessage(['id' => $this->messageIds[$call->otherID], 'peer' => $user, 'message' => $message]);
+                    $this->statusTexts[$call->otherID] = $message;
                 } catch (RPCErrorException $e) {
-                    $this->logger($e);
+                    if ($e->rpc === 'MESSAGE_NOT_MODIFIED') {
+                        // After a restart, the text sent before it isn't known.
+                        $this->statusTexts[$call->otherID] = $message;
+                    } else {
+                        $this->logger($e);
+                    }
                 }
             }
         }
@@ -2899,7 +2910,7 @@ Source code: https://github.com/danog/MadelineProto
         #[Handler]
         public function endedCall(PrivateCall&Ended $call): void
         {
-            unset($this->calls[$call->otherID], $this->messageIds[$call->otherID]);
+            unset($this->calls[$call->otherID], $this->messageIds[$call->otherID], $this->statusTexts[$call->otherID]);
         }
 
         #[Handler]
