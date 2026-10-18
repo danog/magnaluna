@@ -2521,18 +2521,22 @@ namespace {
                 }
                 $prefix = '';
                 if ($better !== null && $better !== $rtmp) {
-                    $switched = $this->switchMode($call, $better, $message->senderId);
-                    if ($switched instanceof GroupCall) {
+                    [$switched, $why] = $this->switchMode($call, $better, $message->senderId);
+                    if ($why === null) {
+                        \assert($switched !== null);
                         $call = $switched;
                         $prefix = $better
                             ? "I restarted the video chat as an RTMP livestream, which can play this file's AAC audio. "
                             : "I restarted the livestream as a video chat, as RTMP livestreams can't play this file. ";
                         // Opened again, for the new kind of call.
                         $file = $this->getFile($message, $url, $better);
-                    } elseif ($file === null) {
-                        return "{$wrong->getMessage()}\n\n$switched";
+                    } elseif ($file === null || $switched === null) {
+                        // Can't be played here, or there's no call to play it in anymore.
+                        return ($wrong !== null ? "{$wrong->getMessage()}\n\n" : '').$why;
                     } else {
-                        $prefix = "$switched\n\n";
+                        // The same call, or one of the same kind (if it couldn't be recreated as the other kind).
+                        $call = $switched;
+                        $prefix = "$why\n\n";
                     }
                 }
                 \assert($file !== null);
@@ -2548,9 +2552,11 @@ namespace {
          * Ending a call cuts everyone off, so only the admins who may manage its calls can make us do it (and we
          * must be able to, too).
          *
-         * @return GroupCall|string The new call, or why we didn't recreate it, asking the user to.
+         * @return array{?Call, ?string} The call to play in, and why it's not of the other kind (asking the user to
+         *                               recreate it), if not: the same call, a new one of the same kind if it
+         *                               couldn't be recreated as the other kind, or none if neither could be created.
          */
-        private function switchMode(Call $call, bool $rtmp, int $userId): GroupCall|string
+        private function switchMode(Call $call, bool $rtmp, int $userId): array
         {
             $what = $rtmp
                 ? 'an RTMP livestream (started with an external streaming app, then send /join again)'
@@ -2558,26 +2564,58 @@ namespace {
             $peer = $call instanceof GroupCall ? $call->peerId : null;
             if ($peer === null || $peer > 0) {
                 // Not the call of a group or channel.
-                return $rtmp ? 'Only RTMP livestreams can play its AAC audio.' : 'Only video chats can play it.';
+                return [$call, $rtmp ? 'Only RTMP livestreams can play its AAC audio.' : 'Only video chats can play it.'];
             }
             $role = in_array($userId, self::ADMINS, true) ? self::ROLE_CALLS : $this->getRole($peer, $userId);
             if ($role !== self::ROLE_CALLS) {
-                return "To play it with its audio, an admin who can manage video chats has to end this call and start $what, or send me the same command to make me do it.";
+                return [$call, "To play it with its audio, an admin who can manage video chats has to end this call and start $what, or send me the same command to make me do it."];
             }
             $chat = $this->getInfo($peer)['Chat'] ?? [];
             if (!($chat['creator'] ?? false) && !($chat['admin_rights']['manage_call'] ?? false)) {
-                return "To play it with its audio, end this call and start $what, or give me the right to manage video chats and send me the same command to make me do it.";
+                return [$call, "To play it with its audio, end this call and start $what, or give me the right to manage video chats and send me the same command to make me do it."];
             }
             try {
                 $call->discard();
-                $new = $this->createGroupCall($peer, rtmpStream: $rtmp);
-                $new->join();
-                $this->broadcast($new);
-                return $new;
             } catch (Throwable $e) {
                 $this->logger($e);
-                return "I couldn't restart the call as $what: {$e->getMessage()}";
+                return [$call, "I couldn't end the call to restart it as $what: {$e->getMessage()}"];
             }
+            try {
+                return [$this->startCall($peer, $rtmp), null];
+            } catch (Throwable $e) {
+                $this->logger($e);
+                $why = "I couldn't restart the call as $what: {$e->getMessage()}";
+            }
+            // Don't leave the group or channel without a call.
+            try {
+                return [$this->startCall($peer, !$rtmp), "$why. I started a call of the same kind again."];
+            } catch (Throwable $e) {
+                $this->logger($e);
+                return [null, "$why, nor of the same kind again: {$e->getMessage()}"];
+            }
+        }
+
+        /**
+         * Start a call in a group or channel, join it and play the default video.
+         *
+         * Telegram refuses to create a call (CREATE_CALL_FAILED) for a few seconds after the previous one was ended.
+         */
+        private function startCall(int $peer, bool $rtmp): GroupCall
+        {
+            for ($attempt = 1; ; $attempt++) {
+                try {
+                    $call = $this->createGroupCall($peer, rtmpStream: $rtmp);
+                    break;
+                } catch (RPCErrorException $e) {
+                    if ($e->rpc !== 'CREATE_CALL_FAILED' || $attempt >= 8) {
+                        throw $e;
+                    }
+                    Tools::sleep(3);
+                }
+            }
+            $call->join();
+            $this->broadcast($call);
+            return $call;
         }
 
         #[FilterCommand('skip')]
