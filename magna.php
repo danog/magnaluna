@@ -2010,6 +2010,7 @@ namespace {
     use danog\MadelineProto\EventHandler\Attributes\Cron;
     use danog\MadelineProto\EventHandler\Attributes\Handler;
     use danog\MadelineProto\EventHandler\Call;
+    use danog\MadelineProto\EventHandler\Calls\GroupCall;
     use danog\MadelineProto\EventHandler\Calls\MultiCallMessage;
     use danog\MadelineProto\EventHandler\Calls\PrivateCall;
     use danog\MadelineProto\EventHandler\Filter\Combinator\FiltersOr;
@@ -2038,6 +2039,21 @@ namespace {
     use Magnaluna\YouTubeLiveStream;
     use Magnaluna\YouTubeMp4Stream;
     use Magnaluna\YouTubeStream;
+
+    /**
+     * A file can only be played in a group call of the other kind: an RTMP livestream (AAC audio), or a video chat
+     * (OPUS audio).
+     */
+    final class WrongModeException extends InvalidArgumentException
+    {
+        /**
+         * @param bool $rtmp Whether the file needs an RTMP livestream, or else a video chat.
+         */
+        public function __construct(string $message, public readonly bool $rtmp)
+        {
+            parent::__construct($message);
+        }
+    }
 
     final class MyEventHandler extends SimpleEventHandler
     {
@@ -2317,7 +2333,14 @@ namespace {
          *
          * @param bool $rtmp Whether it's played in an RTMP livestream, which only carries H.264 video and AAC audio.
          *
-         * @return array{RemoteUrl|YouTubeStream|YouTubeMp4Stream|YouTubeLiveStream, string}
+         * @return array{RemoteUrl|YouTubeStream|YouTubeMp4Stream|YouTubeLiveStream, string, ?bool} The file, the note,
+         *                                                                                      and whether it would
+         *                                                                                      be played better in an
+         *                                                                                      RTMP livestream (true)
+         *                                                                                      or a video chat (false),
+         *                                                                                      if not where requested.
+         *
+         * @throws WrongModeException If it can only be played in the other kind of group call.
          */
         private static function parseUrl(string $url, bool $rtmp): array
         {
@@ -2327,45 +2350,66 @@ namespace {
                 } catch (YouTubeException $e) {
                     throw new InvalidArgumentException("I can't play this YouTube video: {$e->getMessage()}");
                 }
+                if ($video instanceof YouTubeLiveStream && $video->isVideoOnly()) {
+                    // Calls can't play the AAC audio of live streams, only RTMP livestreams.
+                    return [$video, " ({$video->title}, live, just its video: YouTube live streams only have AAC audio, which only RTMP livestreams can play)", true];
+                }
                 return [$video, match (true) {
-                    $video instanceof YouTubeLiveStream => $video->isVideoOnly()
-                        ? " ({$video->title}, live, just its video: YouTube live streams only have AAC audio, which calls can't play, only RTMP livestreams)"
-                        : " ({$video->title}, live)",
+                    $video instanceof YouTubeLiveStream => " ({$video->title}, live)",
                     $video->isAudioOnly() => " ({$video->title}, just its audio)",
                     default => " ({$video->title})",
-                }];
+                }, null];
             }
             if (filter_var($url, FILTER_VALIDATE_URL) === false
                 || !in_array(strtolower((string) parse_url($url, PHP_URL_SCHEME)), ['http', 'https'], true)
             ) {
                 throw new InvalidArgumentException("$url is not a valid http(s) URL!");
             }
-            return [new RemoteUrl($url), $rtmp ? ' (in a livestream, it must be an MP4 or MKV file with H.264 video and AAC audio)' : ''];
+            $ext = strtolower(pathinfo((string) parse_url($url, PHP_URL_PATH), PATHINFO_EXTENSION));
+            if ($rtmp) {
+                if (in_array($ext, ['webm', 'ogg', 'opus'], true)) {
+                    throw new WrongModeException("I can't play this file in an RTMP livestream, which only plays H.264 video and AAC audio: a .$ext file can only be played in a video chat.", false);
+                }
+                return [new RemoteUrl($url), ' (in an RTMP livestream, it must be an MP4 or MKV file with H.264 video and AAC audio)', null];
+            }
+            // MP4 files have AAC audio, which only RTMP livestreams can play.
+            return [new RemoteUrl($url), '', in_array($ext, ['mp4', 'm4a', 'mov'], true) ? true : null];
         }
 
         /**
-         * How a Telegram file will be played: '' if entirely, a note if only partially.
+         * How a Telegram file will be played: '' if entirely, a note if only partially; and whether it would be played
+         * better in an RTMP livestream (true) or a video chat (false), if not where requested.
+         *
+         * @return array{string, ?bool}
+         *
+         * @throws WrongModeException If it can only be played in the other kind of group call.
          */
-        private static function describeMedia(Media $media, bool $rtmp): string
+        private static function describeMedia(Media $media, bool $rtmp): array
         {
             $mime = $media->mimeType;
             $ext = strtolower($media->fileExt);
+            $opus = in_array($mime, ['video/webm', 'audio/webm', 'audio/ogg', 'audio/opus'], true) || in_array($ext, ['.webm', '.ogg', '.opus'], true);
+            $aac = in_array($mime, ['video/mp4', 'audio/mp4', 'video/quicktime', 'audio/x-m4a', 'audio/aac'], true) || in_array($ext, ['.mp4', '.m4a', '.mov', '.aac'], true);
             if ($rtmp) {
                 // Only H.264 and AAC can be published, as they are.
-                if (in_array($mime, ['video/mp4', 'video/x-matroska', 'audio/mp4'], true) || in_array($ext, ['.mp4', '.mkv', '.m4a'], true)) {
-                    return ' (in a livestream, it must have H.264 video and AAC audio)';
+                if ($aac || $mime === 'video/x-matroska' || $ext === '.mkv') {
+                    return [' (in an RTMP livestream, it must have H.264 video and AAC audio)', null];
                 }
-                throw new InvalidArgumentException("I can't play this file in a livestream: send me an MP4 or MKV video with H.264 video and AAC audio.");
+                if ($opus) {
+                    throw new WrongModeException("I can't play this file in an RTMP livestream, which only plays H.264 video and AAC audio: it can only be played in a video chat.", false);
+                }
+                throw new InvalidArgumentException("I can't play this file in an RTMP livestream: send me an MP4 or MKV video with H.264 video and AAC audio.");
             }
-            if (in_array($mime, ['video/webm', 'video/x-matroska', 'audio/webm', 'audio/ogg', 'audio/opus'], true)
-                || in_array($ext, ['.webm', '.mkv', '.ogg', '.opus'], true)
-            ) {
-                return '';
+            if ($opus || $mime === 'video/x-matroska' || $ext === '.mkv') {
+                return ['', null];
             }
             $isVideo = str_starts_with($mime, 'video/');
             // Anything else is converted with ffmpeg, which only plays its audio.
             if (($isVideo || str_starts_with($mime, 'audio/')) && Tools::canConvertOgg()) {
-                return $isVideo ? ' (just its audio: send a WebM or MKV file with VP8, VP9, H.264 or H.265 video to play the video, too)' : '';
+                return [$isVideo ? ' (just its audio: send a WebM or MKV file with VP8, VP9, H.264 or H.265 video to play the video, too)' : '', $aac ? true : null];
+            }
+            if ($aac) {
+                throw new WrongModeException("I can't play this file in a video chat, which only plays OPUS audio: its AAC audio can only be played in an RTMP livestream.", true);
             }
             throw new InvalidArgumentException("I can't play this file: send me a WebM or MKV video (VP8, VP9, H.264 or H.265 with OPUS audio), or an audio file.");
         }
@@ -2375,7 +2419,11 @@ namespace {
          * passed to it (if any), the file it was sent with or the file it replies to (streamed, not downloaded);
          * null if none.
          *
-         * @return array{RemoteUrl|ReadableStream, string}|null
+         * @return array{RemoteUrl|ReadableStream, string, ?bool}|null The file, the note, and whether it would be played
+         *                                                         better in an RTMP livestream (true) or a video chat
+         *                                                         (false), if not where requested.
+         *
+         * @throws WrongModeException If it can only be played in the other kind of group call.
          */
         private function getFile(Message $message, ?string $url, bool $rtmp): ?array
         {
@@ -2390,8 +2438,8 @@ namespace {
             if ($media === null) {
                 return null;
             }
-            $note = self::describeMedia($media, $rtmp);
-            return [$media->getStream(), $note];
+            [$note, $better] = self::describeMedia($media, $rtmp);
+            return [$media->getStream(), $note, $better];
         }
 
         /**
@@ -2425,14 +2473,8 @@ namespace {
                 return;
             }
             [$call, $args] = $target;
-            try {
-                $file = $this->getFile($message, $args[0] ?? null, self::isRtmp($call));
-                $message->reply($file === null
-                    ? 'Reply to a video or audio file with /play, or send /play <URL>, to add it to the playlist.'
-                    : $this->enqueue($call, ...$file));
-            } catch (InvalidArgumentException $e) {
-                $message->reply($e->getMessage());
-            }
+            $message->reply($this->playFile($message, $call, $args[0] ?? null, loop: false)
+                ?? 'Reply to a video or audio file with /play, or send /play <URL>, to add it to the playlist.');
         }
 
         #[FilterCommand('loop')]
@@ -2444,13 +2486,97 @@ namespace {
                 return;
             }
             [$call, $args] = $target;
+            if (($args[0] ?? null) === 'default') {
+                $message->reply($this->setLoop($call, self::defaultVideo($call), ''));
+                return;
+            }
+            $message->reply($this->playFile($message, $call, $args[0] ?? null, loop: true)
+                ?? $this->setLoop($call, null, ''));
+        }
+
+        /**
+         * Add the file a command refers to to the playlist of a call, or loop it.
+         *
+         * A file that can only be played (or is played better) in the other kind of group call, an RTMP livestream
+         * (AAC audio) or a video chat (OPUS audio), makes us recreate the call as one, if both the user and we may;
+         * the user is asked to, otherwise.
+         *
+         * @return ?string The reply, null if the command refers to no file.
+         */
+        private function playFile(Message $message, Call $call, ?string $url, bool $loop): ?string
+        {
+            $rtmp = self::isRtmp($call);
             try {
-                $file = ($args[0] ?? null) === 'default'
-                    ? [self::defaultVideo($call), '']
-                    : $this->getFile($message, $args[0] ?? null, self::isRtmp($call));
-                $message->reply($this->setLoop($call, $file[0] ?? null, $file[1] ?? ''));
+                try {
+                    $file = $this->getFile($message, $url, $rtmp);
+                    $better = $file[2] ?? null;
+                    $wrong = null;
+                } catch (WrongModeException $e) {
+                    $file = null;
+                    $better = $e->rtmp;
+                    $wrong = $e;
+                }
+                if ($file === null && $wrong === null) {
+                    return null;
+                }
+                $prefix = '';
+                if ($better !== null && $better !== $rtmp) {
+                    $switched = $this->switchMode($call, $better, $message->senderId);
+                    if ($switched instanceof GroupCall) {
+                        $call = $switched;
+                        $prefix = $better
+                            ? "I restarted the video chat as an RTMP livestream, which can play this file's AAC audio. "
+                            : "I restarted the livestream as a video chat, as RTMP livestreams can't play this file. ";
+                        // Opened again, for the new kind of call.
+                        $file = $this->getFile($message, $url, $better);
+                    } elseif ($file === null) {
+                        return "{$wrong->getMessage()}\n\n$switched";
+                    } else {
+                        $prefix = "$switched\n\n";
+                    }
+                }
+                \assert($file !== null);
+                return $prefix.($loop ? $this->setLoop($call, $file[0], $file[1]) : $this->enqueue($call, $file[0], $file[1]));
             } catch (InvalidArgumentException $e) {
-                $message->reply($e->getMessage());
+                return $e->getMessage();
+            }
+        }
+
+        /**
+         * Recreate a group call as an RTMP livestream, or as a video chat, joining it and playing the default video.
+         *
+         * Ending a call cuts everyone off, so only the admins who may manage its calls can make us do it (and we
+         * must be able to, too).
+         *
+         * @return GroupCall|string The new call, or why we didn't recreate it, asking the user to.
+         */
+        private function switchMode(Call $call, bool $rtmp, int $userId): GroupCall|string
+        {
+            $what = $rtmp
+                ? 'an RTMP livestream (started with an external streaming app, then send /join again)'
+                : 'a video chat';
+            $peer = $call instanceof GroupCall ? $call->peerId : null;
+            if ($peer === null || $peer > 0) {
+                // Not the call of a group or channel.
+                return $rtmp ? 'Only RTMP livestreams can play its AAC audio.' : 'Only video chats can play it.';
+            }
+            $role = in_array($userId, self::ADMINS, true) ? self::ROLE_CALLS : $this->getRole($peer, $userId);
+            if ($role !== self::ROLE_CALLS) {
+                return "To play it with its audio, an admin who can manage video chats has to end this call and start $what, or send me the same command to make me do it.";
+            }
+            $chat = $this->getInfo($peer)['Chat'] ?? [];
+            if (!($chat['creator'] ?? false) && !($chat['admin_rights']['manage_call'] ?? false)) {
+                return "To play it with its audio, end this call and start $what, or give me the right to manage video chats and send me the same command to make me do it.";
+            }
+            try {
+                $call->discard();
+                $new = $this->createGroupCall($peer, rtmpStream: $rtmp);
+                $new->join();
+                $this->broadcast($new);
+                return $new;
+            } catch (Throwable $e) {
+                $this->logger($e);
+                return "I couldn't restart the call as $what: {$e->getMessage()}";
             }
         }
 
@@ -2501,11 +2627,11 @@ namespace {
                 $reply = match ($matches[1]) {
                     'play' => $arg === null
                         ? 'Send /play <URL> to add a file to the playlist.'
-                        : $this->enqueue($call, ...self::parseUrl($arg, self::isRtmp($call))),
+                        : $this->enqueue($call, ...array_slice(self::parseUrl($arg, self::isRtmp($call)), 0, 2)),
                     'loop' => $this->setLoop($call, ...match ($arg) {
                         null => [null, ''],
                         'default' => [self::defaultVideo($call), ''],
-                        default => self::parseUrl($arg, self::isRtmp($call)),
+                        default => array_slice(self::parseUrl($arg, self::isRtmp($call)), 0, 2),
                     }),
                     'skip' => $this->skip($call),
                 };
