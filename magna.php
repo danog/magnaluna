@@ -2070,9 +2070,10 @@ namespace {
                 return;
             }
             if ($mode === null) {
+                $command = $target === null ? '/adminonly' : "/adminonly $where";
                 $message->reply(isset($this->adminOnly[$peer])
-                    ? "Only the admins of $where can change what I play in its video chat: an admin can send /adminonly off to let everyone do it."
-                    : "Everyone can change what I play in the video chat of $where: an admin can send /adminonly on to keep it to the admins.");
+                    ? "Only the admins of $where can change what I play in its video chat: an admin can send $command off to let everyone do it."
+                    : "Everyone can change what I play in the video chat of $where: an admin can send $command on to keep it to the admins.");
                 return;
             }
             $role = in_array($message->senderId, self::ADMINS, true) ? self::ROLE_CALLS : $this->getRole($peer, $message->senderId);
