@@ -24,6 +24,7 @@ namespace Magnaluna {
     use Amp\Http\Client\HttpClient;
     use Amp\Http\Client\HttpClientBuilder;
     use Amp\Http\Client\Request;
+    use Amp\Http\Client\Response;
     use Closure;
     use Amp\ByteStream\ReadableBuffer;
     use danog\MadelineProto\Logger;
@@ -462,6 +463,24 @@ namespace Magnaluna {
         }
 
         /**
+         * Log the details of a refused format request, to find out why YouTube refused it, and get a new visitor ID
+         * for the next player requests, in case it was flagged.
+         *
+         * Only the VISIONOS client has formats that can be fetched past their start without a PO token, so new URLs
+         * come from it again.
+         */
+        public static function logRefusal(string $what, Response $response, int $client): void
+        {
+            self::$visitorData = null;
+            $headers = [];
+            foreach ($response->getHeaders() as $name => $values) {
+                $headers[] = "$name: ".implode(', ', $values);
+            }
+            $clientName = self::CLIENTS[$client % self::getClientCount()]['context']['clientName'];
+            Logger::log("YouTube refused $what (client $clientName, HTTP {$response->getStatus()}): ".implode('; ', $headers), Logger::WARNING);
+        }
+
+        /**
          * The ID of the video a YouTube link points to, or null if it isn't one.
          */
         public static function parseLink(string $link): ?string
@@ -675,15 +694,12 @@ namespace Magnaluna {
                         return $body;
                     }
                     if ($status === 403 || $status === 410) {
-                        // The URLs expired, were requested from another IP address (they're bound to
-                        // it), or are refused (sometimes for no reason): get new ones, from the next
-                        // client if they're refused again.
+                        // The URLs expired, were requested from another IP address (they're bound to it), or are
+                        // refused: get new ones.
                         $this->urls = null;
-                        if ($attempt % 2 === 0) {
-                            $this->client++;
-                        }
+                        YouTube::logRefusal("the $kind of $this->videoId (itag {$this->{$kind}['itag']}, bytes $start-$end)", $response, $this->client);
                     }
-                    throw new YouTubeException("HTTP status $status, got ".\strlen($body).' bytes');
+                    throw new YouTubeException("HTTP status $status, got ".\strlen($body).' bytes', $status);
                 } catch (CancelledException $e) {
                     throw $e;
                 } catch (Throwable $e) {
@@ -691,7 +707,8 @@ namespace Magnaluna {
                     if ($attempt >= self::ATTEMPTS) {
                         throw new YouTubeException("Could not fetch the $kind of $this->videoId: ".implode('; ', array_unique($errors)), 0, $e);
                     }
-                    delay($attempt, cancellation: $this->cancellation);
+                    // Back off for longer when refused.
+                    delay(\in_array($e->getCode(), [403, 410], true) ? 2 ** $attempt : $attempt, cancellation: $this->cancellation);
                 }
             }
         }
@@ -1688,13 +1705,11 @@ namespace Magnaluna {
                         throw new LiveEdgeException;
                     }
                     if ($status === 403 || $status === 410) {
-                        // The URLs expired, or are refused: get new ones, from the next client if they're refused again.
+                        // The URLs expired, or are refused: get new ones.
                         $this->urls = null;
-                        if ($attempt % 2 === 0) {
-                            $this->client++;
-                        }
+                        YouTube::logRefusal("the $kind of the live stream $this->videoId (itag {$this->{$kind}}, segment ".($sequence ?? 'latest').')', $response, $this->client);
                     }
-                    throw new YouTubeException("HTTP status $status, got ".\strlen($body).' bytes');
+                    throw new YouTubeException("HTTP status $status, got ".\strlen($body).' bytes', $status);
                 } catch (CancelledException|LiveStreamEndedException|LiveEdgeException $e) {
                     throw $e;
                 } catch (Throwable $e) {
@@ -1702,7 +1717,8 @@ namespace Magnaluna {
                     if ($attempt >= self::ATTEMPTS) {
                         throw new YouTubeException("Could not fetch the $kind of the live stream $this->videoId: ".implode('; ', array_unique($errors)), 0, $e);
                     }
-                    delay($attempt, cancellation: $this->cancellation);
+                    // Back off for longer when refused.
+                    delay(\in_array($e->getCode(), [403, 410], true) ? 2 ** $attempt : $attempt, cancellation: $this->cancellation);
                 }
             }
         }
