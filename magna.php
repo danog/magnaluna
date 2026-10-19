@@ -2431,33 +2431,65 @@ namespace {
 
         /** The username, link or ID of a group or channel. */
         private const CHAT_REFERENCE = '~^(?:@\w+|-?\d+|(?:https?://)?(?:t|telegram)\.me/\S+)$~i';
+        /** Invite links of groups and channels: https://t.me/+<hash> or https://t.me/joinchat/<hash>. */
+        private const INVITE_LINK = '~^(?:https?://)?(?:t|telegram)\.me/(?:\+|joinchat/)([\w-]+)$~i';
 
         /**
          * What the first argument of a command refers to, if it's a call rather than a file: the link of a video chat
-         * or conference call, or the username, link or ID of a group or channel.
+         * or conference call, or the username, link (even an invite link) or ID of a group or channel.
          *
-         * @return array{peer: ?int, slug: ?string, inviteHash: ?string, link: bool}|null
+         * @param bool $joinChat Whether to join the group or channel of an invite link, if we're not in it.
+         *
+         * @return array{peer: ?int, slug: ?string, inviteHash: ?string, link: bool, invited: bool}|null
+         *         invited: whether we just joined its group or channel with its invite link.
          *
          * @throws InvalidArgumentException If it's not a group or channel we can see.
          */
-        private function parseTarget(string $arg): ?array
+        private function parseTarget(string $arg, bool $joinChat = false): ?array
         {
             if (preg_match(self::CONFERENCE_LINK, $arg, $matches)) {
-                return ['peer' => null, 'slug' => $matches[1], 'inviteHash' => null, 'link' => true];
+                return ['peer' => null, 'slug' => $matches[1], 'inviteHash' => null, 'link' => true, 'invited' => false];
             }
             $link = preg_match(self::GROUP_CALL_LINK, $arg, $matches) === 1;
             if (!$link && !preg_match(self::CHAT_REFERENCE, $arg)) {
                 return null;
             }
+            $invite = preg_match(self::INVITE_LINK, $arg, $inviteMatches) === 1;
+            $invited = $invite && $joinChat && $this->joinChatByInvite($inviteMatches[1], $arg);
             try {
                 $peer = $this->getId($link ? '@'.$matches[1] : (is_numeric($arg) ? (int) $arg : $arg));
             } catch (Throwable) {
                 $peer = null;
             }
             if ($peer === null || $peer > 0) {
-                throw new InvalidArgumentException("$arg is not a group or channel I can see.");
+                throw new InvalidArgumentException($invite
+                    ? "I'm not in the group or channel of $arg: send /join $arg first!"
+                    : "$arg is not a group or channel I can see.");
             }
-            return ['peer' => $peer, 'slug' => null, 'inviteHash' => $link ? ($matches[2] ?? null) : null, 'link' => $link];
+            return ['peer' => $peer, 'slug' => null, 'inviteHash' => $link ? ($matches[2] ?? null) : null, 'link' => $link, 'invited' => $invited];
+        }
+
+        /**
+         * Join a group or channel with an invite link, unless we're already in it.
+         *
+         * @return bool Whether we joined it now: the link is valid, and lets in without the approval of an admin.
+         *
+         * @throws InvalidArgumentException If we can't join it.
+         */
+        private function joinChatByInvite(string $hash, string $link): bool
+        {
+            try {
+                $this->messages->importChatInvite(hash: $hash);
+                return true;
+            } catch (RPCErrorException $e) {
+                return match ($e->rpc) {
+                    'USER_ALREADY_PARTICIPANT' => false,
+                    'INVITE_REQUEST_SENT' => throw new InvalidArgumentException("I asked to join the group or channel of $link: send /join $link again once its admins accept me!"),
+                    'INVITE_HASH_EXPIRED', 'INVITE_HASH_INVALID', 'INVITE_HASH_EMPTY' => throw new InvalidArgumentException("$link is not a valid invite link (any more)!"),
+                    'CHANNELS_TOO_MUCH' => throw new InvalidArgumentException("I'm in too many groups and channels to join $link!"),
+                    default => throw new InvalidArgumentException("Could not join the group or channel of $link: {$e->rpc}"),
+                };
+            }
         }
 
         /**
@@ -2489,7 +2521,7 @@ namespace {
         {
             $args = $message->commandArgs ?? [];
             try {
-                $target = isset($args[0]) ? $this->parseTarget($args[0]) : null;
+                $target = isset($args[0]) ? $this->parseTarget($args[0], joinChat: $join) : null;
                 if ($target === null) {
                     $call = $message->chatId > 0 ? $this->getCallByPeer($message->chatId) : $this->getGroupCall($message->chatId);
                     if (!$call?->isJoined()) {
@@ -2916,7 +2948,7 @@ namespace {
         {
             $where = $message->commandArgs[0] ?? null;
             try {
-                $target = $where === null ? null : $this->parseTarget($where);
+                $target = $where === null ? null : $this->parseTarget($where, joinChat: true);
             } catch (InvalidArgumentException $e) {
                 $this->respond($message, $e->getMessage());
                 return;
@@ -2965,14 +2997,22 @@ namespace {
                     $call = $this->getGroupCall($target['peer']);
                     // Anyone may use the link of a video chat, as in the app.
                     if (!$target['link']) {
-                        $role = $this->getAccess($target['peer'], $message->senderId);
+                        // Who has an invite link that just let us in may join its group or channel too.
+                        $role = $this->getAccess($target['peer'], $message->senderId)
+                            ?? ($target['invited'] ? self::ROLE_MEMBER : null);
                         if ($role === null) {
                             return "Only the members of $where can make me join its video chat.";
                         }
                         if ($call === null && $role !== self::ROLE_CALLS) {
                             return "There's no video chat in $where: only its admins who can manage video chats can make me start one.";
                         }
-                        $call ??= $this->createGroupCall($target['peer']);
+                        if ($call === null) {
+                            $chat = $this->getInfo($target['peer'])['Chat'] ?? [];
+                            if (!($chat['creator'] ?? false) && !($chat['admin_rights']['manage_call'] ?? false)) {
+                                return "There's no video chat in $where, and I can't start one: start it yourself (then send /join $where again), or make me an admin who can manage video chats.";
+                            }
+                            $call = $this->createGroupCall($target['peer']);
+                        }
                     }
                     $call ?? throw new InvalidArgumentException("There's no video chat in $where!");
                 }
@@ -3233,8 +3273,9 @@ Commands:
 /adminonly on - as an admin, let only the admins of the group change what I play in its video chat (/adminonly off to let everyone do it again)
 
 The commands apply to our call, or to the video chat of the group they're sent in.
-To use them for another video chat, livestream or conference call without sending them in its chat (even from here), put its group or channel (username, link or ID) or its link right after the command, for example:
+To use them for another video chat, livestream or conference call without sending them in its chat (even from here), put its group or channel (username, link, even an invite link, or ID) or its link right after the command, for example:
   /join @mygroup
+  /join https://t.me/+AbCdEf (I join the group first)
   /play @mygroup https://youtu.be/dQw4w9WgXcQ (/play and /loop join the call first, if needed)
   /loop https://t.me/call/... default
   /leave @mygroup
