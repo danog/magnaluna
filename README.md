@@ -14,7 +14,7 @@ magnaluna joins a group call and plays its default video on loop, until you give
 
 - add it to a group and send `/join` (or `/videochat`) there: it joins the video chat, or starts one if none is running and it's allowed to;
 - send it the link of a video chat or livestream (`https://t.me/<username>?videochat`, `?livestream` or `?voicechat`, with its invite hash, if any) or of a conference call (`https://t.me/call/...`);
-- or send `/join <group or channel>` from anywhere, even its private chat, with the username, link or ID of a group or channel: the members of a private group or channel can make it join its video chat, anyone can for a public one, and only the admins who can manage video chats can make it start one.
+- or send `/join <group or channel>` from anywhere, even its private chat, with the username, link or ID of a group or channel: the members of a private group or channel can make it join its video chat, anyone can for a public one, and only the admins who can manage video chats can make it start one. With an invite link (`https://t.me/+...`), it joins the group or channel first, and anyone who has the link can use it.
 
 It plays in both kinds of group calls of Telegram:
 
@@ -41,6 +41,7 @@ To control another video chat, livestream or conference call without sending the
 
 ```
 /join @mygroup
+/join https://t.me/+AbCdEf
 /play @mygroup https://youtu.be/dQw4w9WgXcQ
 /loop https://t.me/call/... default
 /leave @mygroup
