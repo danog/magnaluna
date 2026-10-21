@@ -1911,7 +1911,7 @@ namespace Magnaluna {
                             delay(1, cancellation: $this->cancellation);
                             $waited++;
                         }
-                        Logger::log(sprintf("Got the segment %d (head %d) of the %s of the live stream %s: %d bytes in %.2f seconds, %d waiting", $this->sequence, $head, $kind, $this->videoId, \strlen($segment), microtime(true) - $since, $waited), Logger::VERBOSE);
+                        Logger::log(sprintf("Got the segment %d (head %d) of the %s of the live stream %s: %d bytes in %.2f seconds, %d waiting", $this->sequence, $head, $kind, $this->videoId, \strlen($segment), microtime(true) - $since, $waited), Logger::ULTRA_VERBOSE);
                         $byKind[$kind] = $this->demux($kind, $segment);
                     }
                 } catch (LiveEdgeException) {
