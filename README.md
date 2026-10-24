@@ -51,6 +51,8 @@ To control another video chat, livestream or conference call without sending the
 `/play` and `/loop` join the call first, if needed.
 The commands can also be sent in the chat of a video chat or conference call, where `/play` and `/loop` only take URLs.
 
+The admins of the bot (`ADMINS` in `magna.php`) can send `/joinall` to make it join the video chats of all its groups and channels in which it plays nothing, and loop the default video there; `/joinall <URL>` (or `/joinall` in reply to a file) plays that file first.
+
 ## What it plays
 
 Telegram files are streamed, never downloaded, and so are URLs:
