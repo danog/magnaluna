@@ -2201,6 +2201,7 @@ namespace {
     use danog\MadelineProto\MediaDestination;
     use danog\MadelineProto\ParseMode;
     use danog\MadelineProto\RemoteUrl;
+    use danog\MadelineProto\RPCError\RateLimitError;
     use danog\MadelineProto\RPCErrorException;
     use danog\MadelineProto\Settings;
     use danog\MadelineProto\SimpleEventHandler;
@@ -3099,7 +3100,7 @@ namespace {
         {
             $url = $message->commandArgs[0] ?? null;
             $withFile = $url !== null || $message->media !== null || $message->replyToMsgId !== null;
-            $this->respond($message, 'Joining the video chats of my groups and channels in which I play nothing...');
+            $this->respond($message, 'Joining the video chats of my groups and channels in which I play nothing: it may take a few minutes, as Telegram makes me wait after every few calls I join...');
             $joined = $failed = $fileErrors = [];
             $busy = 0;
             foreach (array_keys($this->getFullDialogs()) as $peer) {
@@ -3112,11 +3113,13 @@ namespace {
                 }
                 $name = self::chatName($chat, $peer);
                 try {
-                    $call = $this->getGroupCall($peer);
+                    $call = self::waitingOutFloods(fn () => $this->getGroupCall($peer));
                     if ($call === null) {
                         // The cached full info of the chat may predate its call.
-                        $this->refreshFullPeerCache($peer);
-                        $call = $this->getGroupCall($peer);
+                        $call = self::waitingOutFloods(function () use ($peer) {
+                            $this->refreshFullPeerCache($peer);
+                            return $this->getGroupCall($peer);
+                        });
                     }
                     if ($call === null) {
                         continue;
@@ -3129,7 +3132,7 @@ namespace {
                         $failed[] = "$name: a livestream, and I'm not an admin who can manage its video chats";
                         continue;
                     }
-                    $call->join();
+                    self::waitingOutFloods($call->join(...));
                     $this->broadcast($call);
                 } catch (Throwable $e) {
                     $this->logger($e);
@@ -3166,6 +3169,29 @@ namespace {
                 $reply .= "\n\nCouldn't join ".count($failed).' video chats:'."\n".implode("\n", array_slice($failed, 0, self::JOIN_ALL_NAMES));
             }
             $this->respond($message, $reply);
+        }
+
+        /**
+         * Run a request, waiting out the flood waits of Telegram instead of failing: joining many calls in a row
+         * gets one after every few calls (FLOOD_WAIT_30 or so on phone.joinGroupCall), longer than MadelineProto
+         * waits by itself.
+         *
+         * @template T
+         *
+         * @param Closure(): T $request
+         *
+         * @return T
+         */
+        private static function waitingOutFloods(Closure $request): mixed
+        {
+            while (true) {
+                try {
+                    return $request();
+                } catch (RateLimitError $e) {
+                    Logger::log("Waiting {$e->getWaitTimeLeft()} seconds for a flood wait: {$e->rpc}", Logger::NOTICE);
+                    Tools::sleep($e->getWaitTimeLeft() + 1);
+                }
+            }
         }
 
         /**
