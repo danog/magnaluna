@@ -2416,6 +2416,8 @@ namespace {
                         default => self::ROLE_MEMBER,
                     };
                 }
+                // Fetched live: the full info is cached for an hour, and a removed or demoted admin must lose their rights now.
+                $this->refreshFullPeerCache($peer);
                 foreach ($this->getFullInfo($peer)['full']['participants']['participants'] ?? [] as $participant) {
                     if ($participant['user_id'] === $userId) {
                         // The admins of basic groups have every right.
