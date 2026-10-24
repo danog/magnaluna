@@ -3082,6 +3082,106 @@ namespace {
             }
         }
 
+        /** How many groups and channels the reply of /joinall names, per outcome. */
+        private const JOIN_ALL_NAMES = 30;
+
+        /**
+         * Join the video chats and livestreams of all our groups and channels in which we play nothing, and loop the
+         * default video there, playing a file first if one is passed (its URL, or the file the command is sent with
+         * or replies to): /joinall [URL], only for the admins of the bot.
+         *
+         * Calls we're in that play something (even a file queued by a member) are left alone. Only the chats whose
+         * call Telegram flags as active are checked, after refreshing the dialogs, so as not to fetch the full info
+         * of every chat.
+         */
+        #[FilterCommand('joinall')]
+        public function joinAllCommand(Incoming&Message&FromAdmin $message): void
+        {
+            $url = $message->commandArgs[0] ?? null;
+            $withFile = $url !== null || $message->media !== null || $message->replyToMsgId !== null;
+            $this->respond($message, 'Joining the video chats of my groups and channels in which I play nothing...');
+            $joined = $failed = $fileErrors = [];
+            $busy = 0;
+            foreach (array_keys($this->getFullDialogs()) as $peer) {
+                if ($peer > 0) {
+                    continue;
+                }
+                $chat = $this->getInfo($peer)['Chat'] ?? [];
+                if (!($chat['call_active'] ?? false) || ($chat['left'] ?? false)) {
+                    continue;
+                }
+                $name = self::chatName($chat, $peer);
+                try {
+                    $call = $this->getGroupCall($peer);
+                    if ($call === null) {
+                        // The cached full info of the chat may predate its call.
+                        $this->refreshFullPeerCache($peer);
+                        $call = $this->getGroupCall($peer);
+                    }
+                    if ($call === null) {
+                        continue;
+                    }
+                    if ($call->isJoined() && $call->getCurrent() !== null) {
+                        $busy++;
+                        continue;
+                    }
+                    if ($call->rtmpStream && !($chat['creator'] ?? false) && !($chat['admin_rights']['manage_call'] ?? false)) {
+                        $failed[] = "$name: a livestream, and I'm not an admin who can manage its video chats";
+                        continue;
+                    }
+                    $call->join();
+                    $this->broadcast($call);
+                } catch (Throwable $e) {
+                    $this->logger($e);
+                    $failed[] = "$name: ".mb_substr($e->getMessage(), 0, 200);
+                    continue;
+                }
+                $joined[] = $name;
+                if (!$withFile) {
+                    continue;
+                }
+                // Opened for each call: a stream can only be played once.
+                try {
+                    $file = $this->getFile($message, $url, self::isRtmp($call));
+                } catch (Throwable $e) {
+                    $fileErrors[$e->getMessage()][] = $name;
+                    continue;
+                }
+                \assert($file !== null);
+                $this->enqueue($call, $file[0], '');
+            }
+
+            $list = static fn (array $names): string => implode(', ', array_slice($names, 0, self::JOIN_ALL_NAMES))
+                .(count($names) > self::JOIN_ALL_NAMES ? ' and '.(count($names) - self::JOIN_ALL_NAMES).' more' : '');
+            $reply = $joined === []
+                ? 'There was no video chat to join.'
+                : 'Joined '.count($joined).' video chats'.($withFile ? ', playing the file before looping my video' : ', looping my video').': '.$list($joined).'.';
+            if ($busy) {
+                $reply .= "\n\nAlready playing something in $busy video chats.";
+            }
+            foreach ($fileErrors as $error => $names) {
+                $reply .= "\n\nCouldn't play the file in ".$list($names).", only looping my video there: $error";
+            }
+            if ($failed !== []) {
+                $reply .= "\n\nCouldn't join ".count($failed).' video chats:'."\n".implode("\n", array_slice($failed, 0, self::JOIN_ALL_NAMES));
+            }
+            $this->respond($message, $reply);
+        }
+
+        /**
+         * The name of a group or channel for replies: its username, or else its title.
+         */
+        private static function chatName(array $chat, int $peer): string
+        {
+            $username = $chat['username'] ?? null;
+            foreach ($chat['usernames'] ?? [] as $entry) {
+                if ($entry['active'] ?? false) {
+                    $username ??= $entry['username'];
+                }
+            }
+            return $username !== null ? "@$username" : ($chat['title'] ?? (string) $peer);
+        }
+
         /**
          * Leave a video chat or conference call: the one of the group, channel or call link passed to the command,
          * or else the video chat of the group it's sent in.
@@ -3246,7 +3346,7 @@ namespace {
                 // Call links are joined by callLink(), instead.
                 // So are the commands for other calls.
                 $isCallLink = preg_match(self::CONFERENCE_LINK, $message->message) || preg_match(self::GROUP_CALL_LINK, $message->message)
-                    || in_array($message->command, ['join', 'videochat', 'leave', 'play', 'loop', 'skip', 'adminonly'], true);
+                    || in_array($message->command, ['join', 'videochat', 'leave', 'play', 'loop', 'skip', 'adminonly', 'joinall'], true);
                 if (!isset($this->my_users[$message->chatId]) || in_array($message->message, ['/start', '/help'], true)) {
                     $runCall = true;
                     $this->my_users[$message->chatId] = true;
@@ -3287,6 +3387,7 @@ Admin only:
 /restart - restart me
 /broadcast - reply to a message to send a copy of it to all my users, and pin it
 /bforward - reply to a message to forward it to all my users, and pin it
+/joinall - join the video chats of all my groups and channels in which I play nothing, and loop my video there (send /joinall <URL>, or reply to a file, to play it first)
 
 I also provide advanced stats during calls!
 
