@@ -2416,7 +2416,7 @@ namespace {
                         default => self::ROLE_MEMBER,
                     };
                 }
-                foreach ($this->messages->getFullChat(chat_id: $peer)['full_chat']['participants']['participants'] ?? [] as $participant) {
+                foreach ($this->getFullInfo($peer)['full']['participants']['participants'] ?? [] as $participant) {
                     if ($participant['user_id'] === $userId) {
                         // The admins of basic groups have every right.
                         return $participant['_'] === 'chatParticipant' ? self::ROLE_MEMBER : self::ROLE_CALLS;
