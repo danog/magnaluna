@@ -2259,6 +2259,13 @@ namespace {
          * @var array<int, true>
          */
         private array $adminOnly = [];
+        /**
+         * The conference calls we joined, by ID, with the slugs of their links: MadelineProto doesn't list them, see
+         * playingCommand().
+         *
+         * @var array<int, string>
+         */
+        private array $conferenceCalls = [];
         public function onStart(): void
         {
             $self = $this->getSelf();
@@ -3031,6 +3038,9 @@ namespace {
                     return $denial;
                 }
                 $this->broadcast($call);
+                if ($target['slug'] ?? null) {
+                    $this->conferenceCalls[$call->id] = $target['slug'];
+                }
                 return $call;
             } catch (CallNotAllowedException $e) {
                 return "I can't start a video chat here: {$e->reason->value}";
@@ -3081,6 +3091,71 @@ namespace {
                 unset($this->adminOnly[$peer]);
                 $this->respond($message, "Everyone can change what I play in the video chat of $where now.");
             }
+        }
+
+        /**
+         * List the calls in which we play something, only for the admins of the bot: the video chats and livestreams
+         * of groups and channels, the calls with users and the conference calls.
+         */
+        #[FilterCommand('playing')]
+        public function playingCommand(Incoming&Message&FromAdmin $message): void
+        {
+            $lines = [];
+            foreach ($this->getAllGroupCalls() as $call) {
+                if (!$call->isJoined() || $call->getCurrent() === null || $call->peerId === null) {
+                    continue;
+                }
+                try {
+                    $info = $this->getInfo($call->peerId);
+                    $where = self::chatName($info['Chat'] ?? $info['User'] ?? [], $call->peerId);
+                } catch (Throwable) {
+                    $where = (string) $call->peerId;
+                }
+                $kind = !$call instanceof GroupCall ? 'live story of' : ($call->rtmpStream ? 'livestream of' : 'video chat of');
+                $lines[] = "$kind $where ({$call->participantsCount} participants): ".self::describeCurrent($call);
+            }
+            foreach ($this->getAllCalls() as $userId => $call) {
+                if ($call->getCallState() !== CallState::RUNNING || $call->getCurrent() === null) {
+                    continue;
+                }
+                try {
+                    $user = $this->getInfo($userId)['User'] ?? [];
+                    $who = isset($user['username']) ? '@'.$user['username'] : trim(($user['first_name'] ?? '').' '.($user['last_name'] ?? '')." ($userId)");
+                } catch (Throwable) {
+                    $who = (string) $userId;
+                }
+                $lines[] = "call with $who: ".self::describeCurrent($call);
+            }
+            foreach ($this->conferenceCalls as $id => $slug) {
+                $call = $this->getConferenceCall($id);
+                if (!$call?->isJoined()) {
+                    unset($this->conferenceCalls[$id]);
+                    continue;
+                }
+                if ($call->getCurrent() !== null) {
+                    $lines[] = "conference call https://t.me/call/$slug ({$call->participantsCount} participants): ".self::describeCurrent($call);
+                }
+            }
+            $this->respond(
+                $message,
+                $lines === []
+                    ? "I'm not playing anything anywhere."
+                    : 'Playing in '.count($lines)." calls:\n\n".implode("\n", $lines),
+                noWebpage: true,
+            );
+        }
+
+        /**
+         * What a call plays: a file, a URL, or a stream (a Telegram file or a YouTube video).
+         */
+        private static function describeCurrent(Call $call): string
+        {
+            $current = $call->getCurrent();
+            return match (true) {
+                $current instanceof LocalFile => in_array($current->file, [self::VIDEO, self::VIDEO_RTMP], true) ? 'my video' : basename($current->file),
+                $current instanceof RemoteUrl => $current->url,
+                default => 'a Telegram file or YouTube video',
+            };
         }
 
         /** How many groups and channels the reply of /joinall names, per outcome. */
@@ -3372,7 +3447,7 @@ namespace {
                 // Call links are joined by callLink(), instead.
                 // So are the commands for other calls.
                 $isCallLink = preg_match(self::CONFERENCE_LINK, $message->message) || preg_match(self::GROUP_CALL_LINK, $message->message)
-                    || in_array($message->command, ['join', 'videochat', 'leave', 'play', 'loop', 'skip', 'adminonly', 'joinall'], true);
+                    || in_array($message->command, ['join', 'videochat', 'leave', 'play', 'loop', 'skip', 'adminonly', 'joinall', 'playing'], true);
                 if (!isset($this->my_users[$message->chatId]) || in_array($message->message, ['/start', '/help'], true)) {
                     $runCall = true;
                     $this->my_users[$message->chatId] = true;
@@ -3413,6 +3488,7 @@ Admin only:
 /restart - restart me
 /broadcast - reply to a message to send a copy of it to all my users, and pin it
 /bforward - reply to a message to forward it to all my users, and pin it
+/playing - list the calls in which I play something
 /joinall - join the video chats of all my groups and channels in which I play nothing, and loop my video there (send /joinall <URL>, or reply to a file, to play it first)
 
 I also provide advanced stats during calls!
@@ -3491,7 +3567,7 @@ Source code: https://github.com/danog/MadelineProto
 
         public function __sleep(): array
         {
-            return ['programmed_call', 'my_users', 'messageIds', 'calls', 'adminOnly'];
+            return ['programmed_call', 'my_users', 'messageIds', 'calls', 'adminOnly', 'conferenceCalls'];
         }
     }
 
