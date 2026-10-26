@@ -2207,6 +2207,7 @@ namespace {
     use danog\MadelineProto\RemoteUrl;
     use danog\MadelineProto\RPCError\RateLimitError;
     use danog\MadelineProto\RPCErrorException;
+    use danog\MadelineProto\RtmpServers;
     use danog\MadelineProto\Settings;
     use danog\MadelineProto\SimpleEventHandler;
     use danog\MadelineProto\Tools;
@@ -2639,13 +2640,15 @@ namespace {
                         $this->rtmpStarting[$user] = ($this->rtmpStarting[$user] ?? 0) + 1;
                         $reserved = true;
                     }
-                    // Anyone but our admins only to servers on the internet, not into our network.
-                    $stream = $this->startRtmpStream($url, publicOnly: !$admin);
+                    // Anyone but our admins only to some servers, not into our network.
+                    $stream = $this->startRtmpStream($url, servers: $admin ? RtmpServers::Any : self::RTMP_SERVERS);
                     $this->rtmpStarters[$stream->id] = $user;
                     $this->broadcast($stream);
                 }
             } catch (RtmpAddressException) {
-                return 'I only stream to RTMP servers on the internet.';
+                return self::RTMP_SERVERS === RtmpServers::Telegram
+                    ? "I only stream to Telegram's RTMP servers (rtmps://...rtmp.t.me/...)."
+                    : 'I only stream to RTMP servers on the internet.';
             } catch (AssertionError) {
                 return self::RTMP_HOWTO;
             } catch (Throwable $e) {
@@ -2660,6 +2663,9 @@ namespace {
             return [$stream, array_values($args)];
         }
 
+
+        /** The RTMP servers users (not our admins) may make us stream to: Telegram's only, or any on the internet. */
+        private const RTMP_SERVERS = RtmpServers::Internet;
 
         /** How many RTMP streams a user (not one of our admins) may start at once. */
         private const MAX_RTMP_STREAMS = 3;
