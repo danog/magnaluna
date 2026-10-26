@@ -2529,6 +2529,30 @@ namespace {
         }
 
         /**
+         * Join a public group or channel (a supergroup or channel we're not in), to join its video chat.
+         *
+         * @throws InvalidArgumentException If we can't join it.
+         */
+        private function joinChatIfNeeded(int $peer, ?string $where): void
+        {
+            $chat = $this->getInfo($peer)['Chat'] ?? [];
+            if (($chat['_'] ?? null) !== 'channel' || !($chat['left'] ?? false)) {
+                return;
+            }
+            try {
+                $this->channels->joinChannel(channel: $peer);
+            } catch (RPCErrorException $e) {
+                throw new InvalidArgumentException(match ($e->rpc) {
+                    'INVITE_REQUEST_SENT' => "I asked to join $where: send the command again once its admins accept me!",
+                    'CHANNELS_TOO_MUCH' => "I'm in too many groups and channels to join $where!",
+                    'CHANNEL_PRIVATE', 'CHANNEL_INVALID' => "$where is not a group or channel I can join.",
+                    'USER_BANNED_IN_CHANNEL' => "I'm banned from $where.",
+                    default => "Could not join $where: {$e->rpc}",
+                });
+            }
+        }
+
+        /**
          * Join a group or channel with an invite link, unless we're already in it.
          *
          * @return bool Whether we joined it now: the link is valid, and lets in without the approval of an admin.
@@ -3138,6 +3162,21 @@ namespace {
         public function joinCommand(Incoming&Message $message): void
         {
             $where = $message->commandArgs[0] ?? null;
+            if ($where !== null && (preg_match(self::RTMP_URL, $where) || strtolower($where) === '@me')) {
+                // Streaming to a Telegram RTMP server, or to our own profile: started (looping the default video).
+                $target = preg_match(self::RTMP_URL, $where)
+                    ? $this->getRtmpStreamFor($message, $where, [], start: true)
+                    : $this->getOwnLiveStoryFor($message, [], start: true);
+                if (is_string($target)) {
+                    $this->respond($message, $target);
+                    return;
+                }
+                $stream = $target[0];
+                $this->respond($message, $stream instanceof RtmpStream
+                    ? "Streaming to {$stream->url}! Send /play, /loop or /skip with the same URL to control what I play there, and /leave with it to stop."
+                    : 'Streaming to my profile! Send /play @me, /loop @me or /skip @me to control what I play there, and /leave @me to end it.');
+                return;
+            }
             try {
                 $target = $where === null ? null : $this->parseTarget($where, joinChat: true);
             } catch (InvalidArgumentException $e) {
@@ -3185,6 +3224,8 @@ namespace {
                     $call = $this->getConferenceCallBySlug($target['slug'])
                         ?? throw new InvalidArgumentException('This conference link is not valid any more!');
                 } else {
+                    // Only the members of a group or channel can join its video chat: join it first, if public.
+                    $this->joinChatIfNeeded($target['peer'], $where);
                     $call = $this->getGroupCall($target['peer']);
                     // Anyone may use the link of a video chat, as in the app.
                     if (!$target['link']) {
@@ -3662,7 +3703,7 @@ Commands:
   /program 29 August 2018 - call me the 29th of august 2018
   /program +1 hour 30 minutes - call me in one hour and thirty minutes
   /program next Thursday - call me next Thursday at midnight
-/join (or /videochat) - join the video chat of the group (or start one, if I'm allowed to)
+/join (or /videochat) - join the video chat of the group (or start one, if I'm allowed to); /join <RTMP URL> starts streaming there
 /leave - leave the video chat of the group
 /play - reply to a video or audio file (or send /play <URL>, even of a YouTube video, playlist or live stream) to add it to the playlist
 /skip - skip the file being played
@@ -3673,7 +3714,7 @@ The commands apply to our call, or to the video chat of the group they're sent i
 To use them for another video chat, livestream or conference call without sending them in its chat (even from here), put its group or channel (username, link, even an invite link, or ID) or its link right after the command, for example:
   /join @mygroup
   /join https://t.me/+AbCdEf (I join the group first)
-  /play @mygroup https://youtu.be/dQw4w9WgXcQ (/play and /loop join the call first, if needed)
+  /play @mygroup https://youtu.be/dQw4w9WgXcQ (/play and /loop join the call first, and its public group or channel, if needed)
   /loop https://t.me/call/... default
   /leave @mygroup
   /adminonly @mygroup on
