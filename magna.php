@@ -2621,6 +2621,10 @@ namespace {
             $admin = in_array($user, self::ADMINS, true);
             $reserved = false;
             try {
+                // Before looking for a stream to it too: there's none to anywhere else (startRtmpStream() checks it again).
+                if (!str_ends_with(strtolower((string) parse_url($url, PHP_URL_HOST)), '.rtmp.t.me')) {
+                    return self::TELEGRAM_ONLY;
+                }
                 $streams = $this->getRtmpStreams();
                 $this->rtmpStarters = array_intersect_key($this->rtmpStarters, $streams);
                 $stream = $this->getRtmpStream($url);
@@ -2643,7 +2647,7 @@ namespace {
                     $this->broadcast($stream);
                 }
             } catch (RtmpAddressException) {
-                return "I only stream to Telegram's RTMP servers (rtmps://...rtmp.t.me/...): the livestreams and live stories started 'with another app' in the Telegram app.";
+                return self::TELEGRAM_ONLY;
             } catch (AssertionError) {
                 return self::RTMP_HOWTO;
             } catch (Throwable $e) {
@@ -2658,6 +2662,8 @@ namespace {
             return [$stream, array_values($args)];
         }
 
+
+        private const TELEGRAM_ONLY = "I only stream to Telegram's RTMP servers (rtmps://...rtmp.t.me/...): the livestreams and live stories started 'with another app' in the Telegram app.";
 
         /** How many RTMP streams a user (not one of our admins) may start at once. */
         private const MAX_RTMP_STREAMS = 3;
