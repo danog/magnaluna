@@ -2174,6 +2174,7 @@ namespace Magnaluna {
 
 namespace {
     use Amp\ByteStream\ReadableStream;
+    use Amp\Dns\DnsRecord;
     use danog\DialogId\DialogId;
     use danog\MadelineProto\Broadcast\Progress;
     use danog\MadelineProto\Broadcast\Status;
@@ -2216,6 +2217,8 @@ namespace {
     use Magnaluna\YouTubeMp4Stream;
     use Magnaluna\YouTubePlaylistEntry;
     use Magnaluna\YouTubeStream;
+
+    use function Amp\Dns\resolve as dnsResolve;
 
     /**
      * A file can only be played in a group call of the other kind: an RTMP livestream (AAC audio), or a video chat
@@ -2269,6 +2272,19 @@ namespace {
          * @var array<int, string>
          */
         private array $conferenceCalls = [];
+        /**
+         * Who started each RTMP stream (its ID): users may stream to a few at once, see getRtmpStreamFor().
+         *
+         * @var array<int, int>
+         */
+        private array $rtmpStarters = [];
+        /**
+         * The RTMP streams started with a URL other than the one they publish to (pinned to the address it was checked
+         * with), by the SHA-256 of the URL sent to us, see getRtmpStreamFor().
+         *
+         * @var array<string, int>
+         */
+        private array $rtmpAliases = [];
         public function onStart(): void
         {
             $self = $this->getSelf();
@@ -2545,7 +2561,7 @@ namespace {
         {
             $args = $message->commandArgs ?? [];
             if (isset($args[0]) && preg_match(self::RTMP_URL, $args[0])) {
-                return $this->getRtmpStreamFor(array_shift($args), $args, $join);
+                return $this->getRtmpStreamFor($message, array_shift($args), $args, $join);
             }
             if (isset($args[0]) && strtolower($args[0]) === '@me') {
                 array_shift($args);
@@ -2600,24 +2616,84 @@ namespace {
          *
          * @return array{RtmpStream, list<string>}|string The stream and the other arguments, or why there is none.
          */
-        private function getRtmpStreamFor(string $url, array $args, bool $start): array|string
+        private function getRtmpStreamFor(Message $message, string $url, array $args, bool $start): array|string
         {
             try {
-                $stream = $this->getRtmpStream($url);
+                $streams = $this->getRtmpStreams();
+                $this->rtmpStarters = array_intersect_key($this->rtmpStarters, $streams);
+                $this->rtmpAliases = array_filter($this->rtmpAliases, static fn (int $id): bool => isset($streams[$id]));
+                $stream = $this->getRtmpStream($url) ?? $streams[$this->rtmpAliases[hash('sha256', $url)] ?? 0] ?? null;
                 if ($stream === null) {
                     if (!$start) {
                         return "I'm not streaming to this RTMP URL: send /play <RTMP URL> <URL of a file> to start.";
                     }
-                    $stream = $this->startRtmpStream($url);
+                    $publishTo = $url;
+                    if (!in_array($message->senderId, self::ADMINS, true)) {
+                        if (count(array_keys($this->rtmpStarters, $message->senderId, true)) >= self::MAX_RTMP_STREAMS) {
+                            return 'I already stream to '.self::MAX_RTMP_STREAMS.' RTMP servers for you: send /leave <RTMP URL> to stop one first.';
+                        }
+                        $publishTo = self::checkRtmpUrl($url);
+                        if ($publishTo === null) {
+                            return 'I only stream to RTMP servers on the internet.';
+                        }
+                    }
+                    $stream = $this->startRtmpStream($publishTo);
+                    $this->rtmpStarters[$stream->id] = $message->senderId;
+                    if ($publishTo !== $url) {
+                        $this->rtmpAliases[hash('sha256', $url)] = $stream->id;
+                    }
                     $this->broadcast($stream);
                 }
             } catch (AssertionError) {
                 return self::RTMP_HOWTO;
             } catch (Throwable $e) {
                 $this->logger($e);
-                return "Could not stream to the RTMP server: {$e->getMessage()}";
+                // Not why: it would tell what is listening where.
+                return 'Could not stream to this RTMP server.';
             }
             return [$stream, array_values($args)];
+        }
+
+        /** How many RTMP streams a user (not one of our admins) may start at once. */
+        private const MAX_RTMP_STREAMS = 3;
+
+        /**
+         * An RTMP URL (followed by its stream key) if its server is on the internet, not in our network: with the
+         * address it was checked with, for an rtmp:// URL (so DNS can't point it elsewhere when connecting); null if
+         * not, or if it can't be resolved.
+         */
+        private static function checkRtmpUrl(#[\SensitiveParameter] string $url): ?string
+        {
+            $host = parse_url($url, PHP_URL_HOST);
+            if (!is_string($host) || $host === '') {
+                return null;
+            }
+            $host = trim($host, '[]');
+            if (filter_var($host, FILTER_VALIDATE_IP) !== false) {
+                $addresses = [$host];
+            } else {
+                try {
+                    $addresses = array_map(static fn (DnsRecord $record): string => $record->getValue(), dnsResolve($host));
+                } catch (Throwable) {
+                    return null;
+                }
+            }
+            if ($addresses === []) {
+                return null;
+            }
+            foreach ($addresses as $address) {
+                if (filter_var($address, FILTER_VALIDATE_IP, FILTER_FLAG_GLOBAL_RANGE) === false) {
+                    return null;
+                }
+            }
+            if (!str_starts_with(strtolower($url), 'rtmp://')) {
+                // rtmps:// connects to the name, which the TLS certificate must match: no service of our network has one.
+                return $url;
+            }
+            // IPv4 if possible: not every network has IPv6.
+            $ipv4 = array_values(array_filter($addresses, static fn (string $address): bool => !str_contains($address, ':')));
+            $pinned = $ipv4[0] ?? "[{$addresses[0]}]";
+            return preg_replace('~^(rtmp://)(?:\[[^\]]+\]|[^/:]+)~i', '${1}'.$pinned, $url, 1);
         }
 
         /** How to send the URL of an RTMP server. */
@@ -3694,7 +3770,7 @@ Source code: https://github.com/danog/MadelineProto
 
         public function __sleep(): array
         {
-            return ['programmed_call', 'my_users', 'messageIds', 'calls', 'adminOnly', 'conferenceCalls'];
+            return ['programmed_call', 'my_users', 'messageIds', 'calls', 'adminOnly', 'conferenceCalls', 'rtmpStarters', 'rtmpAliases'];
         }
     }
 
