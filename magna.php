@@ -2531,16 +2531,19 @@ namespace {
         /**
          * Join a public group or channel (a supergroup or channel we're not in), to join its video chat.
          *
+         * @return ?int The group or channel, if we joined it now.
+         *
          * @throws InvalidArgumentException If we can't join it.
          */
-        private function joinChatIfNeeded(int $peer, ?string $where): void
+        private function joinChatIfNeeded(int $peer, ?string $where): ?int
         {
             $chat = $this->getInfo($peer)['Chat'] ?? [];
             if (($chat['_'] ?? null) !== 'channel' || !($chat['left'] ?? false)) {
-                return;
+                return null;
             }
             try {
                 $this->channels->joinChannel(channel: $peer);
+                return $peer;
             } catch (RPCErrorException $e) {
                 throw new InvalidArgumentException(match ($e->rpc) {
                     'INVITE_REQUEST_SENT' => "I asked to join $where: send the command again once its admins accept me!",
@@ -3224,15 +3227,19 @@ namespace {
                     $call = $this->getConferenceCallBySlug($target['slug'])
                         ?? throw new InvalidArgumentException('This conference link is not valid any more!');
                 } else {
-                    // Only the members of a group or channel can join its video chat: join it first, if public.
-                    $this->joinChatIfNeeded($target['peer'], $where);
                     $call = $this->getGroupCall($target['peer']);
+                    // Only the members of a group or channel can join its video chat: join it first, if public, and only
+                    // if it has one (not to be made to join any channel), leaving it again if we don't join its call.
+                    if ($call !== null) {
+                        $joinedChat = $this->joinChatIfNeeded($target['peer'], $where);
+                    }
                     // Anyone may use the link of a video chat, as in the app.
                     if (!$target['link']) {
                         // Who has an invite link that just let us in may join its group or channel too.
                         $role = $this->getAccess($target['peer'], $message->senderId)
                             ?? ($target['invited'] ? self::ROLE_MEMBER : null);
                         if ($role === null) {
+                            $this->leaveJoinedChat($joinedChat ?? null);
                             return "Only the members of $where can make me join its video chat.";
                         }
                         if ($call === null && $role !== self::ROLE_CALLS) {
@@ -3259,6 +3266,7 @@ namespace {
                     if (!$joined) {
                         $call->leave();
                     }
+                    $this->leaveJoinedChat($joinedChat ?? null);
                     return $denial;
                 }
                 $this->broadcast($call);
@@ -3267,11 +3275,29 @@ namespace {
                 }
                 return $call;
             } catch (CallNotAllowedException $e) {
+                $this->leaveJoinedChat($joinedChat ?? null);
                 return "I can't start a video chat here: {$e->reason->value}";
             } catch (InvalidArgumentException $e) {
+                $this->leaveJoinedChat($joinedChat ?? null);
                 return $e->getMessage();
             } catch (Throwable $e) {
+                $this->leaveJoinedChat($joinedChat ?? null);
                 return "Could not join the call: {$e->getMessage()}";
+            }
+        }
+
+        /**
+         * Leave the group or channel joinChatIfNeeded() joined, if the command it was joined for failed.
+         */
+        private function leaveJoinedChat(?int $peer): void
+        {
+            if ($peer === null) {
+                return;
+            }
+            try {
+                $this->channels->leaveChannel(channel: $peer);
+            } catch (Throwable $e) {
+                $this->logger($e);
             }
         }
 
