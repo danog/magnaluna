@@ -2298,6 +2298,31 @@ namespace {
                     unset($this->programmed_call[$key]);
                 });
             }
+            if (self::SELF_STREAM) {
+                Tools::callFork($this->selfStream(...));
+            }
+        }
+
+        /** Whether to always stream the default video to our own profile (a live story), unless something else is played there. */
+        private const SELF_STREAM = true;
+
+        /**
+         * Stream to our own profile: join our live story (or start one), and loop the default video there if nothing
+         * is played (after a restart, the live story and what it played are resumed).
+         */
+        private function selfStream(): void
+        {
+            try {
+                $live = $this->getOwnLiveStory(joined: false) ?? $this->startLive('me');
+                if (!$live->isJoined()) {
+                    $live->join();
+                }
+                if ($live->getCurrent() === null) {
+                    $this->broadcast($live);
+                }
+            } catch (Throwable $e) {
+                $this->logger("Could not stream to my profile: $e", Logger::ERROR);
+            }
         }
 
         /**
@@ -2706,11 +2731,11 @@ namespace {
         /**
          * The live story we stream to our profile, if any.
          */
-        private function getOwnLiveStory(): ?LiveStory
+        private function getOwnLiveStory(bool $joined = true): ?LiveStory
         {
             $me = $this->getSelf()['id'] ?? null;
             foreach ($this->getAllGroupCalls() as $call) {
-                if ($call instanceof LiveStory && $call->peerId === $me && !$call->discarded && $call->isJoined()) {
+                if ($call instanceof LiveStory && $call->peerId === $me && !$call->discarded && (!$joined || $call->isJoined())) {
                     return $call;
                 }
             }
@@ -3666,7 +3691,7 @@ Admin only:
 /bforward - reply to a message to forward it to all my users, and pin it
 /playing - list the calls in which I play something
 /joinall - join the video chats of all my groups and channels in which I play nothing, and loop my video there (send /joinall <URL>, or reply to a file, to play it first)
-/play @me <URL> - stream to my own profile, as a live story (/loop, /skip too; /leave @me ends it)
+/play @me <URL> - stream to my own profile, as a live story, where I loop my video by default (/loop, /skip too; /leave @me ends it until I restart)
 
 I also provide advanced stats during calls!
 
