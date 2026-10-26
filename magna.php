@@ -2605,8 +2605,9 @@ namespace {
         private const RTMP_URL = '~^rtmps?://~i';
 
         /**
-         * What we publish to an RTMP server, the first argument of a command being its URL followed by the stream key:
-         * started if needed (and if $start), looping the default video while the playlist is empty.
+         * What we publish to a Telegram RTMP server (a livestream or live story started "with another app"), the first
+         * argument of a command being its URL followed by the stream key: started if needed (and if $start), looping the
+         * default video while the playlist is empty.
          *
          * Anyone who has the stream key may choose what we publish, as they could themselves.
          *
@@ -2623,10 +2624,6 @@ namespace {
                 $streams = $this->getRtmpStreams();
                 $this->rtmpStarters = array_intersect_key($this->rtmpStarters, $streams);
                 $stream = $this->getRtmpStream($url);
-                if ($stream !== null && !$admin && in_array($this->rtmpStarters[$stream->id] ?? 0, self::ADMINS, true)) {
-                    // Started by one of our admins, maybe into our network.
-                    return 'Only my admins can choose what I stream there.';
-                }
                 if ($stream === null) {
                     if (!$start) {
                         return "I'm not streaming to this RTMP URL: send /play <RTMP URL> <URL of a file> to start.";
@@ -2640,15 +2637,13 @@ namespace {
                         $this->rtmpStarting[$user] = ($this->rtmpStarting[$user] ?? 0) + 1;
                         $reserved = true;
                     }
-                    // Anyone but our admins only to some servers, not into our network.
-                    $stream = $this->startRtmpStream($url, servers: $admin ? RtmpServers::Any : self::RTMP_SERVERS);
+                    // Only Telegram's RTMP servers, for everyone: never anywhere else (our own network, say).
+                    $stream = $this->startRtmpStream($url, servers: RtmpServers::Telegram);
                     $this->rtmpStarters[$stream->id] = $user;
                     $this->broadcast($stream);
                 }
             } catch (RtmpAddressException) {
-                return self::RTMP_SERVERS === RtmpServers::Telegram
-                    ? "I only stream to Telegram's RTMP servers (rtmps://...rtmp.t.me/...)."
-                    : 'I only stream to RTMP servers on the internet.';
+                return "I only stream to Telegram's RTMP servers (rtmps://...rtmp.t.me/...): the livestreams and live stories started 'with another app' in the Telegram app.";
             } catch (AssertionError) {
                 return self::RTMP_HOWTO;
             } catch (Throwable $e) {
@@ -2663,9 +2658,6 @@ namespace {
             return [$stream, array_values($args)];
         }
 
-
-        /** The RTMP servers users (not our admins) may make us stream to: Telegram's only, or any on the internet. */
-        private const RTMP_SERVERS = RtmpServers::Internet;
 
         /** How many RTMP streams a user (not one of our admins) may start at once. */
         private const MAX_RTMP_STREAMS = 3;
@@ -3657,9 +3649,9 @@ To use them for another video chat, livestream or conference call without sendin
 In the chat of a call, the commands apply to that call (/play and /loop only take URLs there).
 In livestreams, only the admins of the group or channel can choose what I play, and I can play only if I'm an admin too.
 
-I can also stream to any RTMP server: your profile (a live story), a livestream, YouTube, Twitch... Put its URL followed by the stream key right after the command, for example:
+I can also stream to your profile (a live story), or to any livestream, with its RTMP URL: put it followed by the stream key right after the command, for example:
   /play rtmps://dc4-1.rtmp.t.me/s/123456:AbCdEf https://youtu.be/dQw4w9WgXcQ
-To stream to your profile, start a live story 'with another app' in the Telegram app, then copy its server URL and stream key. Send them to me privately: whoever has the stream key can stream there!
+Start a live story (or a livestream) 'with another app' in the Telegram app, then copy its server URL and stream key. Send them to me privately: whoever has the stream key can stream there! I only stream to Telegram's RTMP servers.
 /loop, /skip and /leave work the same way (/leave stops streaming). An RTMP stream only plays H.264 video and AAC audio (MP4 or MKV files, YouTube videos).
 
 Admin only:
