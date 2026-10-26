@@ -2174,7 +2174,6 @@ namespace Magnaluna {
 
 namespace {
     use Amp\ByteStream\ReadableStream;
-    use Amp\Dns\DnsRecord;
     use danog\DialogId\DialogId;
     use danog\MadelineProto\Broadcast\Progress;
     use danog\MadelineProto\Broadcast\Status;
@@ -2190,6 +2189,7 @@ namespace {
     use danog\MadelineProto\EventHandler\Filter\Combinator\FiltersOr;
     use danog\MadelineProto\EventHandler\Filter\FilterCommand;
     use danog\MadelineProto\EventHandler\Media;
+    use danog\MadelineProto\GroupCall\Rtmp\RtmpAddressException;
     use danog\MadelineProto\EventHandler\MediaPlayer;
     use danog\MadelineProto\EventHandler\Message;
     use danog\MadelineProto\EventHandler\Message\GroupMessage;
@@ -2217,8 +2217,6 @@ namespace {
     use Magnaluna\YouTubeMp4Stream;
     use Magnaluna\YouTubePlaylistEntry;
     use Magnaluna\YouTubeStream;
-
-    use function Amp\Dns\resolve as dnsResolve;
 
     /**
      * A file can only be played in a group call of the other kind: an RTMP livestream (AAC audio), or a video chat
@@ -2279,12 +2277,11 @@ namespace {
          */
         private array $rtmpStarters = [];
         /**
-         * The RTMP streams started with a URL other than the one they publish to (pinned to the address it was checked
-         * with), by the SHA-256 of the URL sent to us, see getRtmpStreamFor().
+         * How many RTMP streams each user is starting right now: counted in their limit, see getRtmpStreamFor().
          *
-         * @var array<string, int>
+         * @var array<int, int>
          */
-        private array $rtmpAliases = [];
+        private array $rtmpStarting = [];
         public function onStart(): void
         {
             $self = $this->getSelf();
@@ -2618,83 +2615,56 @@ namespace {
          */
         private function getRtmpStreamFor(Message $message, string $url, array $args, bool $start): array|string
         {
+            $user = $message->senderId;
+            $admin = in_array($user, self::ADMINS, true);
+            $reserved = false;
             try {
                 $streams = $this->getRtmpStreams();
                 $this->rtmpStarters = array_intersect_key($this->rtmpStarters, $streams);
-                $this->rtmpAliases = array_filter($this->rtmpAliases, static fn (int $id): bool => isset($streams[$id]));
-                $stream = $this->getRtmpStream($url) ?? $streams[$this->rtmpAliases[hash('sha256', $url)] ?? 0] ?? null;
+                $stream = $this->getRtmpStream($url);
+                if ($stream !== null && !$admin && in_array($this->rtmpStarters[$stream->id] ?? 0, self::ADMINS, true)) {
+                    // Started by one of our admins, maybe into our network.
+                    return 'Only my admins can choose what I stream there.';
+                }
                 if ($stream === null) {
                     if (!$start) {
                         return "I'm not streaming to this RTMP URL: send /play <RTMP URL> <URL of a file> to start.";
                     }
-                    $publishTo = $url;
-                    if (!in_array($message->senderId, self::ADMINS, true)) {
-                        if (count(array_keys($this->rtmpStarters, $message->senderId, true)) >= self::MAX_RTMP_STREAMS) {
+                    if (!$admin) {
+                        // Counted before anything can suspend: a concurrent command sees it.
+                        $count = count(array_keys($this->rtmpStarters, $user, true)) + ($this->rtmpStarting[$user] ?? 0);
+                        if ($count >= self::MAX_RTMP_STREAMS) {
                             return 'I already stream to '.self::MAX_RTMP_STREAMS.' RTMP servers for you: send /leave <RTMP URL> to stop one first.';
                         }
-                        $publishTo = self::checkRtmpUrl($url);
-                        if ($publishTo === null) {
-                            return 'I only stream to RTMP servers on the internet.';
-                        }
+                        $this->rtmpStarting[$user] = ($this->rtmpStarting[$user] ?? 0) + 1;
+                        $reserved = true;
                     }
-                    $stream = $this->startRtmpStream($publishTo);
-                    $this->rtmpStarters[$stream->id] = $message->senderId;
-                    if ($publishTo !== $url) {
-                        $this->rtmpAliases[hash('sha256', $url)] = $stream->id;
-                    }
+                    // Anyone but our admins only to servers on the internet, not into our network.
+                    $stream = $this->startRtmpStream($url, publicOnly: !$admin);
+                    $this->rtmpStarters[$stream->id] = $user;
                     $this->broadcast($stream);
                 }
+            } catch (RtmpAddressException) {
+                return 'I only stream to RTMP servers on the internet.';
             } catch (AssertionError) {
                 return self::RTMP_HOWTO;
             } catch (Throwable $e) {
                 $this->logger($e);
                 // Not why: it would tell what is listening where.
                 return 'Could not stream to this RTMP server.';
+            } finally {
+                if ($reserved && --$this->rtmpStarting[$user] === 0) {
+                    unset($this->rtmpStarting[$user]);
+                }
             }
             return [$stream, array_values($args)];
         }
 
+
         /** How many RTMP streams a user (not one of our admins) may start at once. */
         private const MAX_RTMP_STREAMS = 3;
 
-        /**
-         * An RTMP URL (followed by its stream key) if its server is on the internet, not in our network: with the
-         * address it was checked with, for an rtmp:// URL (so DNS can't point it elsewhere when connecting); null if
-         * not, or if it can't be resolved.
-         */
-        private static function checkRtmpUrl(#[\SensitiveParameter] string $url): ?string
-        {
-            $host = parse_url($url, PHP_URL_HOST);
-            if (!is_string($host) || $host === '') {
-                return null;
-            }
-            $host = trim($host, '[]');
-            if (filter_var($host, FILTER_VALIDATE_IP) !== false) {
-                $addresses = [$host];
-            } else {
-                try {
-                    $addresses = array_map(static fn (DnsRecord $record): string => $record->getValue(), dnsResolve($host));
-                } catch (Throwable) {
-                    return null;
-                }
-            }
-            if ($addresses === []) {
-                return null;
-            }
-            foreach ($addresses as $address) {
-                if (filter_var($address, FILTER_VALIDATE_IP, FILTER_FLAG_GLOBAL_RANGE) === false) {
-                    return null;
-                }
-            }
-            if (!str_starts_with(strtolower($url), 'rtmp://')) {
-                // rtmps:// connects to the name, which the TLS certificate must match: no service of our network has one.
-                return $url;
-            }
-            // IPv4 if possible: not every network has IPv6.
-            $ipv4 = array_values(array_filter($addresses, static fn (string $address): bool => !str_contains($address, ':')));
-            $pinned = $ipv4[0] ?? "[{$addresses[0]}]";
-            return preg_replace('~^(rtmp://)(?:\[[^\]]+\]|[^/:]+)~i', '${1}'.$pinned, $url, 1);
-        }
+
 
         /** How to send the URL of an RTMP server. */
         private const RTMP_HOWTO = 'Send the RTMP URL followed by the stream key, e.g. /play rtmps://dc4-1.rtmp.t.me/s/123456:AbCdEf <URL of a file> (to stream to your profile, start a live story "with another app" in the Telegram app, then copy its server URL and stream key). Send it to me privately: whoever has the stream key can stream there!';
@@ -3770,7 +3740,7 @@ Source code: https://github.com/danog/MadelineProto
 
         public function __sleep(): array
         {
-            return ['programmed_call', 'my_users', 'messageIds', 'calls', 'adminOnly', 'conferenceCalls', 'rtmpStarters', 'rtmpAliases'];
+            return ['programmed_call', 'my_users', 'messageIds', 'calls', 'adminOnly', 'conferenceCalls', 'rtmpStarters'];
         }
     }
 
