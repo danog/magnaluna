@@ -2182,11 +2182,15 @@ namespace {
     use danog\MadelineProto\EventHandler\Attributes\Handler;
     use danog\MadelineProto\EventHandler\Call;
     use danog\MadelineProto\EventHandler\Calls\GroupCall;
+    use danog\MadelineProto\EventHandler\Calls\LiveStory;
+    use danog\MadelineProto\EventHandler\Calls\RtmpStream;
     use danog\MadelineProto\EventHandler\Calls\MultiCallMessage;
     use danog\MadelineProto\EventHandler\Calls\PrivateCall;
     use danog\MadelineProto\EventHandler\Filter\Combinator\FiltersOr;
     use danog\MadelineProto\EventHandler\Filter\FilterCommand;
     use danog\MadelineProto\EventHandler\Media;
+    use danog\MadelineProto\GroupCall\Rtmp\RtmpAddressException;
+    use danog\MadelineProto\EventHandler\MediaPlayer;
     use danog\MadelineProto\EventHandler\Message;
     use danog\MadelineProto\EventHandler\Message\GroupMessage;
     use danog\MadelineProto\EventHandler\Message\PrivateMessage;
@@ -2203,6 +2207,7 @@ namespace {
     use danog\MadelineProto\RemoteUrl;
     use danog\MadelineProto\RPCError\RateLimitError;
     use danog\MadelineProto\RPCErrorException;
+    use danog\MadelineProto\RtmpServers;
     use danog\MadelineProto\Settings;
     use danog\MadelineProto\SimpleEventHandler;
     use danog\MadelineProto\Tools;
@@ -2266,6 +2271,18 @@ namespace {
          * @var array<int, string>
          */
         private array $conferenceCalls = [];
+        /**
+         * Who started each RTMP stream (its ID): users may stream to a few at once, see getRtmpStreamFor().
+         *
+         * @var array<int, int>
+         */
+        private array $rtmpStarters = [];
+        /**
+         * How many RTMP streams each user is starting right now: counted in their limit, see getRtmpStreamFor().
+         *
+         * @var array<int, int>
+         */
+        private array $rtmpStarting = [];
         public function onStart(): void
         {
             $self = $this->getSelf();
@@ -2281,6 +2298,31 @@ namespace {
                     unset($this->programmed_call[$key]);
                 });
             }
+            if (self::SELF_STREAM) {
+                Tools::callFork($this->selfStream(...));
+            }
+        }
+
+        /** Whether to always stream the default video to our own profile (a live story), unless something else is played there. */
+        private const SELF_STREAM = true;
+
+        /**
+         * Stream to our own profile: join our live story (or start one), and loop the default video there if nothing
+         * is played (after a restart, the live story and what it played are resumed).
+         */
+        private function selfStream(): void
+        {
+            try {
+                $live = $this->getOwnLiveStory(joined: false) ?? $this->startLive('me');
+                if (!$live->isJoined()) {
+                    $live->join();
+                }
+                if ($live->getCurrent() === null) {
+                    $this->broadcast($live);
+                }
+            } catch (Throwable $e) {
+                $this->logger("Could not stream to my profile: $e", Logger::ERROR);
+            }
         }
 
         /**
@@ -2288,12 +2330,14 @@ namespace {
          *
          * In an RTMP livestream, what is played is published to it, which only its admins can do.
          */
-        private function broadcast(Call $call): void
+        private function broadcast(MediaPlayer $call): void
         {
             try {
                 $call->playOnHold(MediaDestination::Camera, self::defaultVideo($call));
             } catch (Throwable $e) {
-                if (self::isRtmp($call)) {
+                if ($call instanceof RtmpStream) {
+                    $call->close();
+                } elseif ($call instanceof MultiCall && self::isRtmp($call)) {
                     // Don't stay in a livestream we can't publish to, only watching it.
                     $call->leave();
                 }
@@ -2302,17 +2346,18 @@ namespace {
         }
 
         /**
-         * Whether a call is an RTMP livestream, which only carries H.264 video and AAC audio.
+         * Whether a call is an RTMP livestream (or we publish to an RTMP server), which only carries H.264 video and
+         * AAC audio.
          */
-        private static function isRtmp(Call $call): bool
+        private static function isRtmp(MediaPlayer $call): bool
         {
-            return $call instanceof MultiCall && $call->isRtmpMode();
+            return $call instanceof RtmpStream || ($call instanceof MultiCall && $call->isRtmpMode());
         }
 
         /**
          * The video looped in a call by default.
          */
-        private static function defaultVideo(Call $call): LocalFile
+        private static function defaultVideo(MediaPlayer $call): LocalFile
         {
             return new LocalFile(self::isRtmp($call) ? self::VIDEO_RTMP : self::VIDEO);
         }
@@ -2347,8 +2392,12 @@ namespace {
          * (or the owner of its live story) may choose it, as they could themselves. The admins of a group or channel
          * can also keep its video chats to themselves, see adminOnlyCommand().
          */
-        private function controlDenial(Call $call, int $userId): ?string
+        private function controlDenial(MediaPlayer $call, int $userId): ?string
         {
+            if ($call instanceof RtmpStream) {
+                // Whoever has its stream key may publish to it themselves.
+                return null;
+            }
             $rtmp = self::isRtmp($call);
             $peer = $call->peerId ?? null;
             if (in_array($userId, self::ADMINS, true) || (!$rtmp && !isset($this->adminOnly[$peer ?? 0]))) {
@@ -2523,13 +2572,24 @@ namespace {
          * passed as its first argument, or else the call of the chat it was sent in (our call with a user, or the
          * video chat of a group).
          *
-         * @param bool $join Whether to join the call passed to it, if we're not in it.
+         * The first argument can also be an RTMP URL followed by its stream key, to publish to that RTMP server (e.g. a
+         * user's live story, or YouTube), or @me, for our own live story (only for our admins).
          *
-         * @return array{Call, list<string>}|string The call and the other arguments, or why there is none.
+         * @param bool $join Whether to join the call passed to it, if we're not in it (or start the RTMP stream, or
+         *                   our live story).
+         *
+         * @return array{MediaPlayer, list<string>}|string The call and the other arguments, or why there is none.
          */
         private function getCallFor(Message $message, bool $join = false): array|string
         {
             $args = $message->commandArgs ?? [];
+            if (isset($args[0]) && preg_match(self::RTMP_URL, $args[0])) {
+                return $this->getRtmpStreamFor($message, array_shift($args), $args, $join);
+            }
+            if (isset($args[0]) && strtolower($args[0]) === '@me') {
+                array_shift($args);
+                return $this->getOwnLiveStoryFor($message, $args, $join);
+            }
             try {
                 $target = isset($args[0]) ? $this->parseTarget($args[0], joinChat: $join) : null;
                 if ($target === null) {
@@ -2564,6 +2624,122 @@ namespace {
                 return $denial;
             }
             return [$call, array_values($args)];
+        }
+
+        /** RTMP(S) URLs. */
+        private const RTMP_URL = '~^rtmps?://~i';
+
+        /**
+         * What we publish to a Telegram RTMP server (a livestream or live story started "with another app"), the first
+         * argument of a command being its URL followed by the stream key: started if needed (and if $start), looping the
+         * default video while the playlist is empty.
+         *
+         * Anyone who has the stream key may choose what we publish, as they could themselves.
+         *
+         * @param list<string> $args The other arguments.
+         *
+         * @return array{RtmpStream, list<string>}|string The stream and the other arguments, or why there is none.
+         */
+        private function getRtmpStreamFor(Message $message, string $url, array $args, bool $start): array|string
+        {
+            $user = $message->senderId;
+            $admin = in_array($user, self::ADMINS, true);
+            $reserved = false;
+            try {
+                // Before looking for a stream to it too: there's none to anywhere else (startRtmpStream() checks it again).
+                if (!str_ends_with(strtolower((string) parse_url($url, PHP_URL_HOST)), '.rtmp.t.me')) {
+                    return self::TELEGRAM_ONLY;
+                }
+                $streams = $this->getRtmpStreams();
+                $this->rtmpStarters = array_intersect_key($this->rtmpStarters, $streams);
+                $stream = $this->getRtmpStream($url);
+                if ($stream === null) {
+                    if (!$start) {
+                        return "I'm not streaming to this RTMP URL: send /play <RTMP URL> <URL of a file> to start.";
+                    }
+                    if (!$admin) {
+                        // Counted before anything can suspend: a concurrent command sees it.
+                        $count = count(array_keys($this->rtmpStarters, $user, true)) + ($this->rtmpStarting[$user] ?? 0);
+                        if ($count >= self::MAX_RTMP_STREAMS) {
+                            return 'I already stream to '.self::MAX_RTMP_STREAMS.' RTMP servers for you: send /leave <RTMP URL> to stop one first.';
+                        }
+                        $this->rtmpStarting[$user] = ($this->rtmpStarting[$user] ?? 0) + 1;
+                        $reserved = true;
+                    }
+                    // Only Telegram's RTMP servers, for everyone: never anywhere else (our own network, say).
+                    $stream = $this->startRtmpStream($url, servers: RtmpServers::Telegram);
+                    $this->rtmpStarters[$stream->id] = $user;
+                    $this->broadcast($stream);
+                }
+            } catch (RtmpAddressException) {
+                return self::TELEGRAM_ONLY;
+            } catch (AssertionError) {
+                return self::RTMP_HOWTO;
+            } catch (Throwable $e) {
+                $this->logger($e);
+                // Not why: it would tell what is listening where.
+                return 'Could not stream to this RTMP server.';
+            } finally {
+                if ($reserved && --$this->rtmpStarting[$user] === 0) {
+                    unset($this->rtmpStarting[$user]);
+                }
+            }
+            return [$stream, array_values($args)];
+        }
+
+
+        private const TELEGRAM_ONLY = "I only stream to Telegram's RTMP servers (rtmps://...rtmp.t.me/...): the livestreams and live stories started 'with another app' in the Telegram app.";
+
+        /** How many RTMP streams a user (not one of our admins) may start at once. */
+        private const MAX_RTMP_STREAMS = 3;
+
+
+
+        /** How to send the URL of an RTMP server. */
+        private const RTMP_HOWTO = 'Send the RTMP URL followed by the stream key, e.g. /play rtmps://dc4-1.rtmp.t.me/s/123456:AbCdEf <URL of a file> (to stream to your profile, start a live story "with another app" in the Telegram app, then copy its server URL and stream key). Send it to me privately: whoever has the stream key can stream there!';
+
+        /**
+         * Our own live story, streamed to our profile: started if needed (and if $start), looping the default video while
+         * the playlist is empty. Only our admins may choose what we stream there.
+         *
+         * @param list<string> $args The other arguments.
+         *
+         * @return array{LiveStory, list<string>}|string The live story and the other arguments, or why there is none.
+         */
+        private function getOwnLiveStoryFor(Message $message, array $args, bool $start): array|string
+        {
+            if (!in_array($message->senderId, self::ADMINS, true)) {
+                return 'Only my admins can choose what I stream to my profile.';
+            }
+            $live = $this->getOwnLiveStory();
+            if ($live === null) {
+                if (!$start) {
+                    return "I'm not streaming to my profile: send /play @me <URL of a file> to start.";
+                }
+                try {
+                    $live = $this->startLive('me');
+                    $live->join();
+                    $this->broadcast($live);
+                } catch (Throwable $e) {
+                    $this->logger($e);
+                    return "Could not start a live story on my profile: {$e->getMessage()}";
+                }
+            }
+            return [$live, array_values($args)];
+        }
+
+        /**
+         * The live story we stream to our profile, if any.
+         */
+        private function getOwnLiveStory(bool $joined = true): ?LiveStory
+        {
+            $me = $this->getSelf()['id'] ?? null;
+            foreach ($this->getAllGroupCalls() as $call) {
+                if ($call instanceof LiveStory && $call->peerId === $me && !$call->discarded && (!$joined || $call->isJoined())) {
+                    return $call;
+                }
+            }
+            return null;
         }
 
         /**
@@ -2705,7 +2881,7 @@ namespace {
          *
          * @param LocalFile|RemoteUrl|ReadableStream|non-empty-list<ReadableStream> $file
          */
-        private function enqueue(Call $call, LocalFile|RemoteUrl|ReadableStream|array $file, string $note): string
+        private function enqueue(MediaPlayer $call, LocalFile|RemoteUrl|ReadableStream|array $file, string $note): string
         {
             foreach (is_array($file) ? $file : [$file] as $item) {
                 $call->then($item);
@@ -2719,7 +2895,7 @@ namespace {
          *
          * @param LocalFile|RemoteUrl|ReadableStream|non-empty-list<ReadableStream>|null $file
          */
-        private function setLoop(Call $call, LocalFile|RemoteUrl|ReadableStream|array|null $file, string $note): string
+        private function setLoop(MediaPlayer $call, LocalFile|RemoteUrl|ReadableStream|array|null $file, string $note): string
         {
             if ($file === null) {
                 $call->playOnHold();
@@ -2768,7 +2944,7 @@ namespace {
          *
          * @return ?string The reply, null if the command refers to no file.
          */
-        private function playFile(Message $message, Call $call, ?string $url, bool $loop): ?string
+        private function playFile(Message $message, MediaPlayer $call, ?string $url, bool $loop): ?string
         {
             $rtmp = self::isRtmp($call);
             try {
@@ -2821,11 +2997,16 @@ namespace {
          *                               recreate it), if not: the same call, a new one of the same kind if it
          *                               couldn't be recreated as the other kind, or none if neither could be created.
          */
-        private function switchMode(Call $call, bool $rtmp, int $userId): array
+        private function switchMode(MediaPlayer $call, bool $rtmp, int $userId): array
         {
             $what = $rtmp
                 ? 'an RTMP livestream (started with an external streaming app, then send /join again)'
                 : 'a video chat';
+            if ($call instanceof RtmpStream) {
+                return [$call, $rtmp
+                    ? 'Only RTMP streams can play it.'
+                    : 'I can only stream H.264 video and AAC audio to an RTMP server (in MP4 or MKV files, or YouTube videos): this file can only be played in a video chat.'];
+            }
             $peer = $call instanceof GroupCall ? $call->peerId : null;
             if ($peer === null || $peer > 0) {
                 // Not the call of a group or channel, which can't be recreated as the other kind.
@@ -2894,7 +3075,7 @@ namespace {
             $this->respond($message, is_string($target) ? $target : $this->skip($target[0]));
         }
 
-        private function skip(Call $call): string
+        private function skip(MediaPlayer $call): string
         {
             $call->skip();
             return 'Skipped!';
@@ -3116,6 +3297,9 @@ namespace {
                 $kind = !$call instanceof GroupCall ? 'live story of' : ($call->rtmpStream ? 'livestream of' : 'video chat of');
                 $lines[] = "$kind $where ({$call->participantsCount} participants): ".self::describeCurrent($call);
             }
+            foreach ($this->getRtmpStreams() as $stream) {
+                $lines[] = "RTMP stream to {$stream->url}".($stream->isConnected() ? '' : ' (not connected)').': '.self::describeCurrent($stream);
+            }
             foreach ($this->getAllCalls() as $userId => $call) {
                 if ($call->getCallState() !== CallState::RUNNING || $call->getCurrent() === null) {
                     continue;
@@ -3150,7 +3334,7 @@ namespace {
         /**
          * What a call plays: a file, a URL, or a stream (a Telegram file or a YouTube video).
          */
-        private static function describeCurrent(Call $call): string
+        private static function describeCurrent(MediaPlayer $call): string
         {
             $current = $call->getCurrent();
             return match (true) {
@@ -3302,8 +3486,18 @@ namespace {
                 return;
             }
             $call = $target[0];
-            \assert($call instanceof MultiCall);
             try {
+                if ($call instanceof RtmpStream) {
+                    $call->close();
+                    $this->respond($message, "Stopped streaming to {$call->url}!");
+                    return;
+                }
+                if ($call instanceof LiveStory && $call->peerId === ($this->getSelf()['id'] ?? null)) {
+                    $call->discard();
+                    $this->respond($message, 'Ended my live story!');
+                    return;
+                }
+                \assert($call instanceof MultiCall);
                 $call->leave();
                 $this->respond($message, 'Left the call!');
             } catch (Throwable $e) {
@@ -3486,12 +3680,18 @@ To use them for another video chat, livestream or conference call without sendin
 In the chat of a call, the commands apply to that call (/play and /loop only take URLs there).
 In livestreams, only the admins of the group or channel can choose what I play, and I can play only if I'm an admin too.
 
+I can also stream to your profile (a live story), or to any livestream, with its RTMP URL: put it followed by the stream key right after the command, for example:
+  /play rtmps://dc4-1.rtmp.t.me/s/123456:AbCdEf https://youtu.be/dQw4w9WgXcQ
+Start a live story (or a livestream) 'with another app' in the Telegram app, then copy its server URL and stream key. Send them to me privately: whoever has the stream key can stream there! I only stream to Telegram's RTMP servers.
+/loop, /skip and /leave work the same way (/leave stops streaming). An RTMP stream only plays H.264 video and AAC audio (MP4 or MKV files, YouTube videos).
+
 Admin only:
 /restart - restart me
 /broadcast - reply to a message to send a copy of it to all my users, and pin it
 /bforward - reply to a message to forward it to all my users, and pin it
 /playing - list the calls in which I play something
 /joinall - join the video chats of all my groups and channels in which I play nothing, and loop my video there (send /joinall <URL>, or reply to a file, to play it first)
+/play @me <URL> - stream to my own profile, as a live story, where I loop my video by default (/loop, /skip too; /leave @me ends it until I restart)
 
 I also provide advanced stats during calls!
 
@@ -3569,7 +3769,7 @@ Source code: https://github.com/danog/MadelineProto
 
         public function __sleep(): array
         {
-            return ['programmed_call', 'my_users', 'messageIds', 'calls', 'adminOnly', 'conferenceCalls'];
+            return ['programmed_call', 'my_users', 'messageIds', 'calls', 'adminOnly', 'conferenceCalls', 'rtmpStarters'];
         }
     }
 
