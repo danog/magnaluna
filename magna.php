@@ -2278,6 +2278,13 @@ namespace {
          */
         private array $rtmpStarters = [];
         /**
+         * How many commands are joining the video chat of each group or channel: the one that joined the chat for it
+         * leaves it on failure only if it's the last.
+         *
+         * @var array<int, int>
+         */
+        private array $chatJoins = [];
+        /**
          * How many RTMP streams each user is starting right now: counted in their limit, see getRtmpStreamFor().
          *
          * @var array<int, int>
@@ -2372,9 +2379,29 @@ namespace {
          * Reply to a message, unless we may not write in its chat (a group where we're restricted, a channel's
          * discussion group we didn't join): the command was carried out anyway.
          */
+        /**
+         * Escape a plain text message for ParseMode::HTML, showing the commands in it (between backticks) as code.
+         */
+        private static function formatCommands(string $text): string
+        {
+            return preg_replace('~`([^`\n]+)`~', '<code>$1</code>', htmlspecialchars($text, ENT_NOQUOTES));
+        }
+        /**
+         * Send a plain text message (its commands between backticks, see formatCommands()) in the chat of a call.
+         */
+        private static function sayInCall(MultiCall $call, string $text): void
+        {
+            $call->sendMessage(self::formatCommands($text), ParseMode::HTML);
+        }
         private function respond(Message $to, mixed ...$args): void
         {
             // Not named $message, which callers pass as a named argument of reply().
+            // A plain text message: its commands (between backticks) shown as code.
+            if (!isset($args['parseMode'])) {
+                $key = isset($args['message']) ? 'message' : 0;
+                $args[$key] = self::formatCommands($args[$key]);
+                $args['parseMode'] = ParseMode::HTML;
+            }
             try {
                 $to->reply(...$args);
             } catch (RPCErrorException $e) {
@@ -2417,7 +2444,7 @@ namespace {
             }
             return $rtmp
                 ? "Only the admins of this livestream's group or channel can choose what I play in it."
-                : 'Only the admins of this group or channel can choose what I play in its video chat (one of them sent /adminonly on).';
+                : 'Only the admins of this group or channel can choose what I play in its video chat (one of them sent `/adminonly on`).';
         }
 
         /**
@@ -2522,7 +2549,7 @@ namespace {
             }
             if ($peer === null || $peer > 0) {
                 throw new InvalidArgumentException($invite
-                    ? "I'm not in the group or channel of $arg: send /join $arg first!"
+                    ? "I'm not in the group or channel of $arg: send `/join $arg` first!"
                     : "$arg is not a group or channel I can see.");
             }
             return ['peer' => $peer, 'slug' => null, 'inviteHash' => $link ? ($matches[2] ?? null) : null, 'link' => $link, 'invited' => $invited];
@@ -2570,7 +2597,7 @@ namespace {
             } catch (RPCErrorException $e) {
                 return match ($e->rpc) {
                     'USER_ALREADY_PARTICIPANT' => false,
-                    'INVITE_REQUEST_SENT' => throw new InvalidArgumentException("I asked to join the group or channel of $link: send /join $link again once its admins accept me!"),
+                    'INVITE_REQUEST_SENT' => throw new InvalidArgumentException("I asked to join the group or channel of $link: send `/join $link` again once its admins accept me!"),
                     'INVITE_HASH_EXPIRED', 'INVITE_HASH_INVALID', 'INVITE_HASH_EMPTY' => throw new InvalidArgumentException("$link is not a valid invite link (any more)!"),
                     'CHANNELS_TOO_MUCH' => throw new InvalidArgumentException("I'm in too many groups and channels to join $link!"),
                     default => throw new InvalidArgumentException("Could not join the group or channel of $link: {$e->rpc}"),
@@ -2631,7 +2658,7 @@ namespace {
                         : $this->getGroupCall($target['peer']);
                     if (!$call?->isJoined()) {
                         if (!$join) {
-                            return "I'm not in the call of $where: send /join $where first!";
+                            return "I'm not in the call of $where: send `/join $where` first!";
                         }
                         $call = $this->joinCall($message, $target, $where);
                         if (is_string($call)) {
@@ -2682,13 +2709,13 @@ namespace {
                 $stream = $this->getRtmpStream($url);
                 if ($stream === null) {
                     if (!$start) {
-                        return "I'm not streaming to this RTMP URL: send /play <RTMP URL> <URL of a file> to start.";
+                        return "I'm not streaming to this RTMP URL: send `/play <RTMP URL> <URL of a file>` to start.";
                     }
                     if (!$admin) {
                         // Counted before anything can suspend: a concurrent command sees it.
                         $count = count(array_keys($this->rtmpStarters, $user, true)) + ($this->rtmpStarting[$user] ?? 0);
                         if ($count >= self::MAX_RTMP_STREAMS) {
-                            return 'I already stream to '.self::MAX_RTMP_STREAMS.' RTMP servers for you: send /leave <RTMP URL> to stop one first.';
+                            return 'I already stream to '.self::MAX_RTMP_STREAMS.' RTMP servers for you: send `/leave <RTMP URL>` to stop one first.';
                         }
                         $this->rtmpStarting[$user] = ($this->rtmpStarting[$user] ?? 0) + 1;
                         $reserved = true;
@@ -2723,7 +2750,7 @@ namespace {
 
 
         /** How to send the URL of an RTMP server. */
-        private const RTMP_HOWTO = 'Send the RTMP URL followed by the stream key, e.g. /play rtmps://dc4-1.rtmp.t.me/s/123456:AbCdEf <URL of a file> (to stream to your profile, start a live story "with another app" in the Telegram app, then copy its server URL and stream key). Send it to me privately: whoever has the stream key can stream there!';
+        private const RTMP_HOWTO = 'Send the RTMP URL followed by the stream key, e.g. `/play rtmps://dc4-1.rtmp.t.me/s/123456:AbCdEf <URL of a file>` (to stream to your profile, start a live story "with another app" in the Telegram app, then copy its server URL and stream key). Send it to me privately: whoever has the stream key can stream there!';
 
         /**
          * Our own live story, streamed to our profile: started if needed (and if $start), looping the default video while
@@ -2741,7 +2768,7 @@ namespace {
             $live = $this->getOwnLiveStory();
             if ($live === null) {
                 if (!$start) {
-                    return "I'm not streaming to my profile: send /play @me <URL of a file> to start.";
+                    return "I'm not streaming to my profile: send `/play @me <URL of a file>` to start.";
                 }
                 try {
                     $live = $this->startLive('me');
@@ -2913,7 +2940,7 @@ namespace {
             foreach (is_array($file) ? $file : [$file] as $item) {
                 $call->then($item);
             }
-            return "Added to the playlist$note! Send /skip to skip the file being played.";
+            return "Added to the playlist$note! Send `/skip` to skip the file being played.";
         }
 
         /**
@@ -2926,7 +2953,7 @@ namespace {
         {
             if ($file === null) {
                 $call->playOnHold();
-                return 'Not looping anything anymore: nothing plays when the playlist is empty. Send /loop default to loop the default video again.';
+                return 'Not looping anything anymore: nothing plays when the playlist is empty. Send `/loop default` to loop the default video again.';
             }
             $call->playOnHold(MediaDestination::Camera, ...(is_array($file) ? $file : [$file]));
             return (is_array($file) ? 'Now looping this playlist' : 'Now looping this file')."$note when the playlist is empty!";
@@ -2942,7 +2969,7 @@ namespace {
             }
             [$call, $args] = $target;
             $this->respond($message, $this->playFile($message, $call, $args[0] ?? null, loop: false)
-                ?? 'Reply to a video or audio file with /play, or send /play <URL>, to add it to the playlist.');
+                ?? 'Reply to a video or audio file with `/play`, or send `/play <URL>`, to add it to the playlist.');
         }
 
         #[FilterCommand('loop')]
@@ -3027,7 +3054,7 @@ namespace {
         private function switchMode(MediaPlayer $call, bool $rtmp, int $userId): array
         {
             $what = $rtmp
-                ? 'an RTMP livestream (started with an external streaming app, then send /join again)'
+                ? 'an RTMP livestream (started with an external streaming app, then send `/join` again)'
                 : 'a video chat';
             if ($call instanceof RtmpStream) {
                 return [$call, $rtmp
@@ -3041,7 +3068,7 @@ namespace {
                     return [$call, 'Only video chats can play it.'];
                 }
                 $here = $call instanceof PrivateCall ? 'Calls with users' : 'Conference calls';
-                return [$call, "$here only play OPUS audio (other audio is converted with ffmpeg, if installed, without the video): AAC audio and H.264 video are only played as they are in the RTMP livestreams of groups and channels. To play it in one, send the same command with the group or channel right after it, e.g. /play @mygroup <URL> (I must be an admin who can manage its video chats)."];
+                return [$call, "$here only play OPUS audio (other audio is converted with ffmpeg, if installed, without the video): AAC audio and H.264 video are only played as they are in the RTMP livestreams of groups and channels. To play it in one, send the same command with the group or channel right after it, e.g. `/play @mygroup <URL>` (I must be an admin who can manage its video chats)."];
             }
             $role = in_array($userId, self::ADMINS, true) ? self::ROLE_CALLS : $this->getRole($peer, $userId);
             if ($role !== self::ROLE_CALLS) {
@@ -3111,8 +3138,8 @@ namespace {
         private function notInCall(Message $message): string
         {
             return $message->chatId > 0
-                ? "We're not in a call: call me or send /call first! To change what I play in a video chat or conference call, add its group, channel or link after the command, e.g. /play @group <URL>."
-                : "I'm not in this group's video chat: send /join first!";
+                ? "We're not in a call: call me or send `/call` first! To change what I play in a video chat or conference call, add its group, channel or link after the command, e.g. `/play @group <URL>`."
+                : "I'm not in this group's video chat: send `/join` first!";
         }
 
         /**
@@ -3129,11 +3156,11 @@ namespace {
             }
             $denial = $this->controlDenial($call, $message->fromId);
             if ($denial !== null) {
-                $call->sendMessage($denial);
+                self::sayInCall($call, $denial);
                 return;
             }
             if ($matches[1] === 'leave') {
-                $call->sendMessage('Bye!');
+                self::sayInCall($call, 'Bye!');
                 $call->leave();
                 return;
             }
@@ -3141,7 +3168,7 @@ namespace {
             try {
                 $reply = match ($matches[1]) {
                     'play' => $arg === null
-                        ? 'Send /play <URL> to add a file to the playlist.'
+                        ? 'Send `/play <URL>` to add a file to the playlist.'
                         : $this->enqueue($call, ...array_slice(self::parseUrl($arg, self::isRtmp($call)), 0, 2)),
                     'loop' => $this->setLoop($call, ...match ($arg) {
                         null => [null, ''],
@@ -3153,7 +3180,7 @@ namespace {
             } catch (InvalidArgumentException $e) {
                 $reply = $e->getMessage();
             }
-            $call->sendMessage($reply);
+            self::sayInCall($call, $reply);
         }
 
         /**
@@ -3176,8 +3203,8 @@ namespace {
                 }
                 $stream = $target[0];
                 $this->respond($message, $stream instanceof RtmpStream
-                    ? "Streaming to {$stream->url}! Send /play, /loop or /skip with the same URL to control what I play there, and /leave with it to stop."
-                    : 'Streaming to my profile! Send /play @me, /loop @me or /skip @me to control what I play there, and /leave @me to end it.');
+                    ? "Streaming to {$stream->url}! Send `/play`, `/loop` or `/skip` with the same URL to control what I play there, and `/leave` with it to stop."
+                    : 'Streaming to my profile! Send `/play @me`, `/loop @me` or `/skip @me` to control what I play there, and `/leave @me` to end it.');
                 return;
             }
             try {
@@ -3187,7 +3214,7 @@ namespace {
                 return;
             }
             if ($target === null && ($where !== null || !$message instanceof GroupMessage)) {
-                $this->respond($message, 'Send /join <username or link of a group or channel, or link of a call> to make me join its video chat, livestream or conference call (or just /join in a group).');
+                $this->respond($message, 'Send `/join <username or link of a group or channel, or link of a call>` to make me join its video chat, livestream or conference call (or just `/join` in a group).');
                 return;
             }
             $this->respond($message, self::joinedReply($this->joinCall($message, $target, $where), $where));
@@ -3206,7 +3233,7 @@ namespace {
             }
             return $where === null
                 ? 'Playing in the video chat!'
-                : "Joined! Send /play $where, /loop $where, /skip $where or /leave $where (here, or anywhere else) to control what I play there.";
+                : "Joined! Send `/play $where`, `/loop $where`, `/skip $where` or `/leave $where` (here, or anywhere else) to control what I play there.";
         }
 
         /**
@@ -3227,6 +3254,8 @@ namespace {
                     $call = $this->getConferenceCallBySlug($target['slug'])
                         ?? throw new InvalidArgumentException('This conference link is not valid any more!');
                 } else {
+                    $chatJoin = $target['peer'];
+                    $this->chatJoins[$chatJoin] = ($this->chatJoins[$chatJoin] ?? 0) + 1;
                     $call = $this->getGroupCall($target['peer']);
                     // Only the members of a group or channel can join its video chat: join it first, if public, and only
                     // if it has one (not to be made to join any channel), leaving it again if we don't join its call.
@@ -3248,7 +3277,7 @@ namespace {
                         if ($call === null) {
                             $chat = $this->getInfo($target['peer'])['Chat'] ?? [];
                             if (!($chat['creator'] ?? false) && !($chat['admin_rights']['manage_call'] ?? false)) {
-                                return "There's no video chat in $where, and I can't start one: start it yourself (then send /join $where again), or make me an admin who can manage video chats.";
+                                return "There's no video chat in $where, and I can't start one: start it yourself (then send `/join $where` again), or make me an admin who can manage video chats.";
                             }
                             $call = $this->createGroupCall($target['peer']);
                         }
@@ -3283,6 +3312,10 @@ namespace {
             } catch (Throwable $e) {
                 $this->leaveJoinedChat($joinedChat ?? null);
                 return "Could not join the call: {$e->getMessage()}";
+            } finally {
+                if (isset($chatJoin) && --$this->chatJoins[$chatJoin] === 0) {
+                    unset($this->chatJoins[$chatJoin]);
+                }
             }
         }
 
@@ -3291,7 +3324,8 @@ namespace {
          */
         private function leaveJoinedChat(?int $peer): void
         {
-            if ($peer === null) {
+            // Not while another command is joining its call (it may have found us in it already), or once we're in it.
+            if ($peer === null || $this->chatJoins[$peer] > 1 || $this->getGroupCall($peer)?->isJoined()) {
                 return;
             }
             try {
@@ -3319,14 +3353,14 @@ namespace {
             $peer = $target === null ? ($message->chatId < 0 ? $message->chatId : null) : $target['peer'];
             $mode = $args[0] ?? null;
             if ($peer === null || !in_array($mode, [null, 'on', 'off'], true)) {
-                $this->respond($message, 'Send /adminonly on (or off) in a group, or /adminonly <username, link or ID of a group or channel> on (or off) anywhere, to let only its admins (or everyone again) change what I play in its video chat.');
+                $this->respond($message, 'Send `/adminonly on` (or `off`) in a group, or `/adminonly <username, link or ID of a group or channel> on` (or `off`) anywhere, to let only its admins (or everyone again) change what I play in its video chat.');
                 return;
             }
             if ($mode === null) {
                 $command = $target === null ? '/adminonly' : "/adminonly $where";
                 $this->respond($message, isset($this->adminOnly[$peer])
-                    ? "Only the admins of $where can change what I play in its video chat: an admin can send $command off to let everyone do it."
-                    : "Everyone can change what I play in the video chat of $where: an admin can send $command on to keep it to the admins.");
+                    ? "Only the admins of $where can change what I play in its video chat: an admin can send `$command off` to let everyone do it."
+                    : "Everyone can change what I play in the video chat of $where: an admin can send `$command on` to keep it to the admins.");
                 return;
             }
             $role = in_array($message->senderId, self::ADMINS, true) ? self::ROLE_CALLS : $this->getRole($peer, $message->senderId);
@@ -3544,7 +3578,7 @@ namespace {
         public function leaveCommand(Incoming&Message $message): void
         {
             if ($message->chatId > 0 && !isset($message->commandArgs[0])) {
-                $this->respond($message, 'Send /leave <username or link of a group or channel, or link of a call> to make me leave its call.');
+                $this->respond($message, 'Send `/leave <username or link of a group or channel, or link of a call>` to make me leave its call.');
                 return;
             }
             $target = $this->getCallFor($message);
@@ -3715,58 +3749,58 @@ namespace {
                     $runCall = true;
                     $this->my_users[$message->chatId] = true;
                     $this->respond($message, 
-                        message: "Hi, I'm {$this->me} the video webradio.
+                        message: str_replace(['_me_', '**awesome**', '_you_'], ['<i>me</i>', '<b>awesome</b>', '<i>you</i>'], self::formatCommands("Hi, I'm {$this->me} the video webradio.
 
-Call _me_ to watch an **awesome** video, or send /call to make _me_ call _you_ (don't forget to disable call privacy settings!).
+Call _me_ to watch an **awesome** video, or send `/call` to make _me_ call _you_ (don't forget to disable call privacy settings!).
 
 Send me the link of a video chat, livestream or conference call, and I'll join it too!
-Add me to your group and send /join to make me join its video chat.
+Add me to your group and send `/join` to make me join its video chat.
 
 Commands:
-/start (or /help) - show this message
-/call - make me call you
-/program <time> - program a call, for example:
-  /program 29 August 2018 - call me the 29th of august 2018
-  /program +1 hour 30 minutes - call me in one hour and thirty minutes
-  /program next Thursday - call me next Thursday at midnight
-/join (or /videochat) - join the video chat of the group (or start one, if I'm allowed to); /join <RTMP URL> starts streaming there
-/leave - leave the video chat of the group
-/play - reply to a video or audio file (or send /play <URL>, even of a YouTube video, playlist or live stream) to add it to the playlist
-/skip - skip the file being played
-/loop - reply to a file (or send /loop <URL>, even of a YouTube video, playlist or live stream) to loop it instead of my video when the playlist is empty, send just /loop to loop nothing, /loop default to loop my video again
-/adminonly on - as an admin, let only the admins of the group change what I play in its video chat (/adminonly off to let everyone do it again)
+`/start` (or `/help`) - show this message
+`/call` - make me call you
+`/program <time>` - program a call, for example:
+  `/program 29 August 2018` - call me the 29th of august 2018
+  `/program +1 hour 30 minutes` - call me in one hour and thirty minutes
+  `/program next Thursday` - call me next Thursday at midnight
+`/join` (or `/videochat`) - join the video chat of the group (or start one, if I'm allowed to); `/join <RTMP URL>` starts streaming there
+`/leave` - leave the video chat of the group
+`/play` - reply to a video or audio file (or send `/play <URL>`, even of a YouTube video, playlist or live stream) to add it to the playlist
+`/skip` - skip the file being played
+`/loop` - reply to a file (or send `/loop <URL>`, even of a YouTube video, playlist or live stream) to loop it instead of my video when the playlist is empty, send just `/loop` to loop nothing, `/loop default` to loop my video again
+`/adminonly on` - as an admin, let only the admins of the group change what I play in its video chat (`/adminonly off` to let everyone do it again)
 
 The commands apply to our call, or to the video chat of the group they're sent in.
 To use them for another video chat, livestream or conference call without sending them in its chat (even from here), put its group or channel (username, link, even an invite link, or ID) or its link right after the command, for example:
-  /join @mygroup
-  /join https://t.me/+AbCdEf (I join the group first)
-  /play @mygroup https://youtu.be/dQw4w9WgXcQ (/play and /loop join the call first, and its public group or channel, if needed)
-  /loop https://t.me/call/... default
-  /leave @mygroup
-  /adminonly @mygroup on
-In the chat of a call, the commands apply to that call (/play and /loop only take URLs there).
+  `/join @mygroup`
+  `/join https://t.me/+AbCdEf` (I join the group first)
+  `/play @mygroup https://youtu.be/dQw4w9WgXcQ` (`/play` and `/loop` join the call first, and its public group or channel, if needed)
+  `/loop https://t.me/call/... default`
+  `/leave @mygroup`
+  `/adminonly @mygroup on`
+In the chat of a call, the commands apply to that call (`/play` and `/loop` only take URLs there).
 In livestreams, only the admins of the group or channel can choose what I play, and I can play only if I'm an admin too.
 
 I can also stream to your profile (a live story), or to any livestream, with its RTMP URL: put it followed by the stream key right after the command, for example:
-  /play rtmps://dc4-1.rtmp.t.me/s/123456:AbCdEf https://youtu.be/dQw4w9WgXcQ
+  `/play rtmps://dc4-1.rtmp.t.me/s/123456:AbCdEf https://youtu.be/dQw4w9WgXcQ`
 Start a live story (or a livestream) 'with another app' in the Telegram app, then copy its server URL and stream key. Send them to me privately: whoever has the stream key can stream there! I only stream to Telegram's RTMP servers.
-/loop, /skip and /leave work the same way (/leave stops streaming). An RTMP stream only plays H.264 video and AAC audio (MP4 or MKV files, YouTube videos).
+`/loop`, `/skip` and `/leave` work the same way (`/leave` stops streaming). An RTMP stream only plays H.264 video and AAC audio (MP4 or MKV files, YouTube videos).
 
 Admin only:
-/restart - restart me
-/broadcast - reply to a message to send a copy of it to all my users, and pin it
-/bforward - reply to a message to forward it to all my users, and pin it
-/playing - list the calls in which I play something
-/joinall - join the video chats of all my groups and channels in which I play nothing, and loop my video there (send /joinall <URL>, or reply to a file, to play it first)
-/play @me <URL> - stream to my own profile, as a live story, where I loop my video by default (/loop, /skip too; /leave @me ends it until I restart)
+`/restart` - restart me
+`/broadcast` - reply to a message to send a copy of it to all my users, and pin it
+`/bforward` - reply to a message to forward it to all my users, and pin it
+`/playing` - list the calls in which I play something
+`/joinall` - join the video chats of all my groups and channels in which I play nothing, and loop my video there (send `/joinall <URL>`, or reply to a file, to play it first)
+`/play @me <URL>` - stream to my own profile, as a live story, where I loop my video by default (`/loop`, `/skip` too; `/leave @me` ends it until I restart)
 
 I also provide advanced stats during calls!
 
 I'm a userbot powered by @MadelineProto, created by @danogentili.
 
 Source code: https://github.com/danog/MadelineProto
-",
-                        parseMode: ParseMode::MARKDOWN,
+")),
+                        parseMode: ParseMode::HTML,
                         noWebpage: true
                     );
                 }
