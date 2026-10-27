@@ -2332,6 +2332,25 @@ namespace {
             }
         }
 
+        /** Whether an admin ended our live story (`/leave @me`): it's not started again until we restart. */
+        private bool $selfStreamEnded = false;
+
+        /**
+         * Start streaming to our own profile again when our live story ends (Telegram ended it, or we were dropped from
+         * it), unless an admin ended it.
+         */
+        #[Handler]
+        public function liveStoryEnded(LiveStory $call): void
+        {
+            if (!self::SELF_STREAM || !$call->discarded || $call->peerId !== $this->myId || $this->selfStreamEnded
+                || $this->getOwnLiveStory(joined: false) !== null
+            ) {
+                return;
+            }
+            $this->logger("My live story {$call->id} ended after {$call->duration} seconds, starting another one", Logger::WARNING);
+            $this->selfStream();
+        }
+
         /**
          * Play the video in a call, on loop.
          *
@@ -3594,6 +3613,7 @@ namespace {
                     return;
                 }
                 if ($call instanceof LiveStory && $call->peerId === ($this->getSelf()['id'] ?? null)) {
+                    $this->selfStreamEnded = true;
                     $call->discard();
                     $this->respond($message, 'Ended my live story!');
                     return;
