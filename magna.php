@@ -2173,6 +2173,7 @@ namespace Magnaluna {
 }
 
 namespace {
+    use Amp\ByteStream\ReadableBuffer;
     use Amp\ByteStream\ReadableStream;
     use danog\DialogId\DialogId;
     use danog\MadelineProto\Broadcast\Progress;
@@ -2203,6 +2204,7 @@ namespace {
     use danog\MadelineProto\LocalFile;
     use danog\MadelineProto\Logger;
     use danog\MadelineProto\MediaDestination;
+    use danog\MadelineProto\Mp4;
     use danog\MadelineProto\ParseMode;
     use danog\MadelineProto\RemoteUrl;
     use danog\MadelineProto\RPCError\RateLimitError;
@@ -2891,9 +2893,81 @@ namespace {
             return [new RemoteUrl($url), '', in_array($ext, ['mp4', 'm4a', 'mov'], true) ? true : null];
         }
 
+        /** The largest moov box read to find the audio codec of an MP4 file. */
+        private const MAX_MOOV_SIZE = 16 << 20;
+        /** How many top-level boxes of an MP4 file are walked to find its moov: real files have a handful. */
+        private const MAX_MP4_BOXES = 64;
+
+        /**
+         * The audio codec of a Telegram MP4 file, as a Matroska codec ID ('' if it has none), from its moov box;
+         * null if it can't be found.
+         *
+         * Telegram's own videos keep the moov after the media data: the top-level boxes are walked by their headers,
+         * with ranged downloads, so that only the moov is downloaded wherever it is, never the whole file.
+         */
+        private static function mp4AudioCodec(Media $media): ?string
+        {
+            $read = static function (int $offset, int $length) use ($media): ?string {
+                if ($offset < 0 || $length <= 0 || $offset + $length > $media->size) {
+                    return null;
+                }
+                $stream = $media->getStream(offset: $offset, end: $offset + $length);
+                $data = '';
+                try {
+                    while (strlen($data) < $length && ($chunk = $stream->read()) !== null) {
+                        $data .= $chunk;
+                    }
+                } finally {
+                    $stream->close();
+                }
+                return strlen($data) >= $length ? substr($data, 0, $length) : null;
+            };
+            // Each box costs a download: a file made of many tiny boxes must not make us download it piecewise.
+            for ($offset = 0, $boxes = 0; $boxes < self::MAX_MP4_BOXES && ($header = $read($offset, 8)) !== null; $offset += $size, $boxes++) {
+                [, $size] = unpack('N', $header);
+                $headerSize = 8;
+                if ($size === 1) {
+                    $large = $read($offset + 8, 8);
+                    if ($large === null) {
+                        return null;
+                    }
+                    [, $size] = unpack('J', $large);
+                    $headerSize = 16;
+                } elseif ($size === 0) {
+                    // To the end of the file.
+                    $size = $media->size - $offset;
+                }
+                if ($size < $headerSize) {
+                    return null;
+                }
+                if (substr($header, 4, 4) !== 'moov') {
+                    continue;
+                }
+                $moov = $size <= self::MAX_MOOV_SIZE ? $read($offset, $size) : null;
+                if ($moov === null) {
+                    return null;
+                }
+                try {
+                    $tracks = (new Mp4(new ReadableBuffer($moov)))->tracks;
+                } catch (Throwable) {
+                    return null;
+                }
+                foreach ($tracks as $track) {
+                    if ($track['type'] === Mp4::TRACK_TYPE_AUDIO) {
+                        return $track['codec'];
+                    }
+                }
+                return '';
+            }
+            return null;
+        }
+
         /**
          * How a Telegram file will be played: '' if entirely, a note if only partially; and whether it would be played
          * better in an RTMP livestream (true) or a video chat (false), if not where requested.
+         *
+         * MP4 files are played as they are, like Matroska ones: their audio only if it's AAC in an RTMP livestream, or
+         * OPUS in a video chat, so it's read from the file.
          *
          * @return array{string, ?bool}
          *
@@ -2904,7 +2978,22 @@ namespace {
             $mime = $media->mimeType;
             $ext = strtolower($media->fileExt);
             $opus = in_array($mime, ['video/webm', 'audio/webm', 'audio/ogg', 'audio/opus'], true) || in_array($ext, ['.webm', '.ogg', '.opus'], true);
-            $aac = in_array($mime, ['video/mp4', 'audio/mp4', 'video/quicktime', 'audio/x-m4a', 'audio/aac'], true) || in_array($ext, ['.mp4', '.m4a', '.mov', '.aac'], true);
+            $mp4 = in_array($mime, ['video/mp4', 'audio/mp4', 'video/quicktime', 'audio/x-m4a'], true) || in_array($ext, ['.mp4', '.m4a', '.mov'], true);
+            if ($mp4) {
+                $audio = self::mp4AudioCodec($media);
+                if ($rtmp) {
+                    if ($audio === 'A_OPUS') {
+                        throw new WrongModeException("I can't play this file in an RTMP livestream, which only plays H.264 video and AAC audio: its audio is OPUS, so it can only be played in a video chat.", false);
+                    }
+                    return [' (in an RTMP livestream, it must have H.264 video and AAC audio)', null];
+                }
+                return match ($audio) {
+                    'A_OPUS', '' => ['', null],
+                    'A_AAC' => [' (without its audio: video chats only play OPUS audio, and its audio is AAC)', true],
+                    default => [' (with its audio only if it is OPUS: video chats can\'t play AAC audio)', null],
+                };
+            }
+            $aac = $mime === 'audio/aac' || $ext === '.aac';
             if ($rtmp) {
                 // Only H.264 and AAC can be published, as they are.
                 if ($aac || $mime === 'video/x-matroska' || $ext === '.mkv') {
@@ -2921,12 +3010,12 @@ namespace {
             $isVideo = str_starts_with($mime, 'video/');
             // Anything else is converted with ffmpeg, which only plays its audio.
             if (($isVideo || str_starts_with($mime, 'audio/')) && Tools::canConvertOgg()) {
-                return [$isVideo ? ' (just its audio: send a WebM or MKV file with VP8, VP9, H.264 or H.265 video to play the video, too)' : '', $aac ? true : null];
+                return [$isVideo ? ' (just its audio: send a WebM, MKV or MP4 file with VP8, VP9, H.264 or H.265 video to play the video, too)' : '', $aac ? true : null];
             }
             if ($aac) {
                 throw new WrongModeException("I can't play this file here: calls and video chats only play OPUS audio, and I can't convert its AAC audio without ffmpeg.", true);
             }
-            throw new InvalidArgumentException("I can't play this file: send me a WebM or MKV video (VP8, VP9, H.264 or H.265 with OPUS audio), or an audio file.");
+            throw new InvalidArgumentException("I can't play this file: send me a WebM, MKV or MP4 video (VP8, VP9, H.264 or H.265 with OPUS audio), or an audio file.");
         }
 
         /**
