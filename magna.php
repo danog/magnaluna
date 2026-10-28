@@ -2328,7 +2328,15 @@ namespace {
                     $this->broadcast($live);
                 }
             } catch (Throwable $e) {
-                $this->logger("Could not stream to my profile: $e", Logger::ERROR);
+                // Retried later instead of given up (it stayed down until a restart): the live stories that ended in
+                // the last day still count towards the limit of active stories (STORIES_TOO_MUCH), while not listed.
+                $retry = $e instanceof RPCErrorException && $e->rpc === 'STORIES_TOO_MUCH' ? 1800 : 600;
+                $this->logger("Could not stream to my profile, retrying in $retry seconds: $e", Logger::ERROR);
+                \Revolt\EventLoop::delay($retry, function (): void {
+                    if (!$this->selfStreamEnded && $this->getOwnLiveStory(joined: false) === null) {
+                        $this->selfStream();
+                    }
+                });
             }
         }
 
