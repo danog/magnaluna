@@ -2895,6 +2895,8 @@ namespace {
 
         /** The largest moov box read to find the audio codec of an MP4 file. */
         private const MAX_MOOV_SIZE = 16 << 20;
+        /** How many top-level boxes of an MP4 file are walked to find its moov: real files have a handful. */
+        private const MAX_MP4_BOXES = 64;
 
         /**
          * The audio codec of a Telegram MP4 file, as a Matroska codec ID ('' if it has none), from its moov box;
@@ -2920,7 +2922,8 @@ namespace {
                 }
                 return strlen($data) >= $length ? substr($data, 0, $length) : null;
             };
-            for ($offset = 0; ($header = $read($offset, 8)) !== null; $offset += $size) {
+            // Each box costs a download: a file made of many tiny boxes must not make us download it piecewise.
+            for ($offset = 0, $boxes = 0; $boxes < self::MAX_MP4_BOXES && ($header = $read($offset, 8)) !== null; $offset += $size, $boxes++) {
                 [, $size] = unpack('N', $header);
                 $headerSize = 8;
                 if ($size === 1) {
