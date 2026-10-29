@@ -886,7 +886,7 @@ namespace Magnaluna {
          * @param string $videoId   The ID of the video, see {@see YouTube::parseLink()}.
          * @param int    $maxHeight The highest resolution to play.
          *
-         * @return self|YouTubeLiveStream A live stream is played as a YouTubeLiveStream, just its video.
+         * @return self|YouTubeLiveStream A live stream is played as a YouTubeLiveStream (its AAC audio transcoded to OPUS).
          *
          * @throws YouTubeException If it can't be played.
          */
@@ -894,7 +894,7 @@ namespace Magnaluna {
         {
             [$player, $userAgent, $client] = YouTube::getPlayer($videoId, $cancellation);
             if ($player['videoDetails']['isLive'] ?? false) {
-                return YouTubeLiveStream::fromPlayer($videoId, $player, $userAgent, $client, audio: false, maxHeight: $maxHeight);
+                return YouTubeLiveStream::fromPlayer($videoId, $player, $userAgent, $client, audio: true, maxHeight: $maxHeight);
             }
             $video = YouTube::pickVideo($player, $maxHeight);
             $audio = YouTube::pickAudio($player)
@@ -1633,8 +1633,8 @@ namespace Magnaluna {
     }
 
     /**
-     * A YouTube live stream, as a Matroska file with H.264 video and AAC audio, that can be played in calls (just its
-     * video: calls only carry OPUS audio) and in RTMP livestreams.
+     * A YouTube live stream, as a Matroska file with H.264 video and AAC audio, that can be played in calls (which
+     * transcode the AAC audio to OPUS) and in RTMP livestreams.
      *
      * YouTube serves the video and the audio of a live stream as separate formats, a self-contained fragmented MP4
      * segment at a time (of about 5 seconds, numbered, with the same clock): the segments are fetched as they're
@@ -1738,7 +1738,7 @@ namespace Magnaluna {
         /**
          * Open a YouTube live stream, from the player response of its video.
          *
-         * @param bool $audio     Whether to play its audio too (AAC, which only RTMP livestreams carry).
+         * @param bool $audio     Whether to play its audio too (AAC).
          * @param int  $maxHeight The highest resolution to play.
          *
          * @throws YouTubeException If it can't be played.
@@ -1750,7 +1750,7 @@ namespace Magnaluna {
             if ($video === null && $audioFormat === null) {
                 throw new YouTubeException($audio
                     ? 'This live stream has no H.264 video or AAC audio'
-                    : 'This live stream has no H.264 video, and its audio (AAC) can only be played in RTMP livestreams');
+                    : 'This live stream has no H.264 video');
             }
             $stream = new self($videoId, $player['videoDetails']['title'] ?? $videoId, $video['itag'] ?? null, $audioFormat['itag'] ?? null);
             $stream->client = $client;
@@ -1984,14 +1984,6 @@ namespace Magnaluna {
         public function isAudioOnly(): bool
         {
             return $this->video === null;
-        }
-
-        /**
-         * Whether just the video will be played, as calls only carry OPUS audio.
-         */
-        public function isVideoOnly(): bool
-        {
-            return $this->audio === null;
         }
 
         #[\Override]
@@ -2867,10 +2859,6 @@ namespace {
                 } catch (YouTubeException $e) {
                     throw new InvalidArgumentException("I can't play this YouTube video: {$e->getMessage()}");
                 }
-                if ($video instanceof YouTubeLiveStream && $video->isVideoOnly()) {
-                    // Calls can't play the AAC audio of live streams, only RTMP livestreams.
-                    return [$video, " ({$video->title}, live, just its video: YouTube live streams only have AAC audio, which only RTMP livestreams can play)", true];
-                }
                 return [$video, match (true) {
                     $video instanceof YouTubeLiveStream => " ({$video->title}, live)",
                     $video->isAudioOnly() => " ({$video->title}, just its audio)",
@@ -2889,8 +2877,7 @@ namespace {
                 }
                 return [new RemoteUrl($url), ' (in an RTMP livestream, it must be an MP4 or MKV file with H.264 video and AAC audio)', null];
             }
-            // MP4 files have AAC audio, which only RTMP livestreams can play.
-            return [new RemoteUrl($url), '', in_array($ext, ['mp4', 'm4a', 'mov'], true) ? true : null];
+            return [new RemoteUrl($url), '', null];
         }
 
         /** The largest moov box read to find the audio codec of an MP4 file. */
@@ -2966,8 +2953,8 @@ namespace {
          * How a Telegram file will be played: '' if entirely, a note if only partially; and whether it would be played
          * better in an RTMP livestream (true) or a video chat (false), if not where requested.
          *
-         * MP4 files are played as they are, like Matroska ones: their audio only if it's AAC in an RTMP livestream, or
-         * OPUS in a video chat, so it's read from the file.
+         * MP4 files are played as they are, like Matroska ones (AAC audio transcoded to OPUS in video chats): only an
+         * RTMP livestream can't play their audio if it's OPUS, so it's read from the file there.
          *
          * @return array{string, ?bool}
          *
@@ -2980,18 +2967,13 @@ namespace {
             $opus = in_array($mime, ['video/webm', 'audio/webm', 'audio/ogg', 'audio/opus'], true) || in_array($ext, ['.webm', '.ogg', '.opus'], true);
             $mp4 = in_array($mime, ['video/mp4', 'audio/mp4', 'video/quicktime', 'audio/x-m4a'], true) || in_array($ext, ['.mp4', '.m4a', '.mov'], true);
             if ($mp4) {
-                $audio = self::mp4AudioCodec($media);
-                if ($rtmp) {
-                    if ($audio === 'A_OPUS') {
-                        throw new WrongModeException("I can't play this file in an RTMP livestream, which only plays H.264 video and AAC audio: its audio is OPUS, so it can only be played in a video chat.", false);
-                    }
-                    return [' (in an RTMP livestream, it must have H.264 video and AAC audio)', null];
+                if (!$rtmp) {
+                    return ['', null];
                 }
-                return match ($audio) {
-                    'A_OPUS', '' => ['', null],
-                    'A_AAC' => [' (without its audio: video chats only play OPUS audio, and its audio is AAC)', true],
-                    default => [' (with its audio only if it is OPUS: video chats can\'t play AAC audio)', null],
-                };
+                if (self::mp4AudioCodec($media) === 'A_OPUS') {
+                    throw new WrongModeException("I can't play this file in an RTMP livestream, which only plays H.264 video and AAC audio: its audio is OPUS, so it can only be played in a video chat.", false);
+                }
+                return [' (in an RTMP livestream, it must have H.264 video and AAC audio)', null];
             }
             $aac = $mime === 'audio/aac' || $ext === '.aac';
             if ($rtmp) {
@@ -3010,7 +2992,7 @@ namespace {
             $isVideo = str_starts_with($mime, 'video/');
             // Anything else is converted with ffmpeg, which only plays its audio.
             if (($isVideo || str_starts_with($mime, 'audio/')) && Tools::canConvertOgg()) {
-                return [$isVideo ? ' (just its audio: send a WebM, MKV or MP4 file with VP8, VP9, H.264 or H.265 video to play the video, too)' : '', $aac ? true : null];
+                return [$isVideo ? ' (just its audio: send a WebM, MKV or MP4 file with VP8, VP9, H.264 or H.265 video to play the video, too)' : '', null];
             }
             if ($aac) {
                 throw new WrongModeException("I can't play this file here: calls and video chats only play OPUS audio, and I can't convert its AAC audio without ffmpeg.", true);
@@ -3184,7 +3166,7 @@ namespace {
                     return [$call, 'Only video chats can play it.'];
                 }
                 $here = $call instanceof PrivateCall ? 'Calls with users' : 'Conference calls';
-                return [$call, "$here only play OPUS audio (other audio is converted with ffmpeg, if installed, without the video): AAC audio and H.264 video are only played as they are in the RTMP livestreams of groups and channels. To play it in one, send the same command with the group or channel right after it, e.g. `/play @mygroup <URL>` (I must be an admin who can manage its video chats)."];
+                return [$call, "$here only play OPUS audio (the AAC audio of MP4 and MKV files is transcoded, other audio converted with ffmpeg, if installed, without the video), and only RTMP livestreams of groups and channels play AAC audio as it is. To play it in one, send the same command with the group or channel right after it, e.g. `/play @mygroup <URL>` (I must be an admin who can manage its video chats)."];
             }
             $role = in_array($userId, self::ADMINS, true) ? self::ROLE_CALLS : $this->getRole($peer, $userId);
             if ($role !== self::ROLE_CALLS) {
